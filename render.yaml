@@ -1,0 +1,22 @@
+services:
+  - type: worker
+    name: apna-ai-store-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: GROUP_ID
+        sync: false
+      - key: GROUP_LINK
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: PRICE_STARS
+        value: "150"
+      - key: INITIAL_STOCK
+        value: "10"
