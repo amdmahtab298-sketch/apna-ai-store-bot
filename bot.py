@@ -1449,6 +1449,43 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
+def _start_health_server():
+    """Render WEB SERVICE ke liye chhota sa HTTP health server ($PORT pe).
+
+    Render ke free plan pe Background Worker nahi milta — isliye bot ek
+    Web Service ki tarah chalta hai, aur Render ko ek khula port chahiye
+    hota hai. Ye server sirf 'alive' jawab deta hai (pinger ke liye bhi).
+    Local/Worker run me PORT nahi hota — waha ye kuch nahi karta.
+    """
+    import os as _os
+    import threading as _threading
+    port = _os.getenv("PORT")
+    if not port:
+        return
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"Apna AI Store Bot is alive")
+
+        def do_HEAD(self):
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", int(port)), _H)
+        _threading.Thread(target=srv.serve_forever, daemon=True).start()
+        log.info("🌐 Health server chalu hai — port %s", port)
+    except Exception as e:
+        log.warning("Health server nahi chala: %s", e)
+
+
 async def _post_init(app: Application):
     init_db()
 
@@ -1504,6 +1541,7 @@ def main():
         app.job_queue.run_daily(daily_report_job, time=dtime(hour=21, minute=0, tzinfo=IST))
 
     log.info("🚀 %s bot start ho raha hai…", STORE_NAME)
+    _start_health_server()
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
