@@ -1538,7 +1538,7 @@ def main():
     # Pending-input (private chat) — commands ke alawa
     app.add_handler(
         MessageHandler(
-            filters.ChatType.PRIVATE & (filters.TEXT | filters.PHOTO | filters.Document) & ~filters.COMMAND,
+            filters.ChatType.PRIVATE & (filters.TEXT | filters.PHOTO | filters.ATTACHMENT) & ~filters.COMMAND,
             handle_input,
         )
     )
