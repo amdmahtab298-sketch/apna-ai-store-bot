@@ -58,17 +58,28 @@ except Exception:  # pragma: no cover
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
+def _env_int(name, default):
+    """Env var ko surakshit int me badlo — galat/text value pe crash ki
+    jagah default use hoga (deploy pe chhoti typing galti bot na mare)."""
+    try:
+        raw = str(os.environ.get(name, "")).strip()
+        return int(raw) if raw else int(default)
+    except (TypeError, ValueError):
+        print(f"⚠️ {name} ki value number nahi hai — default {default} use hoga")
+        return int(default)
+
+
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 ADMIN_IDS = {
     int(x.strip())
     for x in os.environ.get("ADMIN_IDS", "").replace(";", ",").split(",")
     if x.strip().lstrip("-").isdigit()
 }
-GROUP_ID = int(os.environ.get("GROUP_ID", "0") or 0)
+GROUP_ID = _env_int("GROUP_ID", 0)
 GROUP_LINK = os.environ.get("GROUP_LINK", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-PRICE_STARS = int(os.environ.get("PRICE_STARS", "150") or 150)
-INITIAL_STOCK = int(os.environ.get("INITIAL_STOCK", "10") or 10)
+PRICE_STARS = _env_int("PRICE_STARS", 150)
+INITIAL_STOCK = _env_int("INITIAL_STOCK", 10)
 DB_PATH = os.environ.get("DB_PATH", "store.db")
 
 STORE_NAME = "Apna AI Store"
