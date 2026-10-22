@@ -110,6 +110,9 @@ PRODUCT_TEXT = (
     f"🛡️ <b>Warranty: {WARRANTY_DAYS} Days</b> (delivery ke din se)\n"
 )
 
+# Seed ke liye sirf features wala hissa (validity/warranty page pe product-row se aayenge)
+SEED_PRODUCT_DESC = PRODUCT_TEXT.split("⏳")[0].rstrip()
+
 TERMS_TEXT = (
     "📜 <b>Terms — kharidne se pehle padh lo</b>\n\n"
     "1️⃣ Ye ek digital subscription hai — ElevenLabs Starter Plan, 40,000 credits.\n"
@@ -244,6 +247,13 @@ def db_all(sql, params=()):
     return _with_conn(work)
 
 
+def _ensure_column(table, col, decl):
+    try:
+        db_exec(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+    except Exception:
+        pass  # column pehle se maujud hai
+
+
 def init_db():
     id_col = "BIGSERIAL PRIMARY KEY" if USE_PG else "INTEGER PRIMARY KEY AUTOINCREMENT"
     stmts = [
@@ -266,6 +276,12 @@ def init_db():
             description TEXT, photo_file_id TEXT, status TEXT DEFAULT 'open',
             created_at TEXT)""",
         """CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)""",
+        f"""CREATE TABLE IF NOT EXISTS products(
+            id {id_col}, name TEXT, price_stars INTEGER DEFAULT 0, mrp_text TEXT DEFAULT '',
+            description TEXT DEFAULT '', validity_days INTEGER DEFAULT 30,
+            warranty_days INTEGER DEFAULT 25, stock INTEGER DEFAULT 0,
+            photo_file_id TEXT DEFAULT '', is_active INTEGER DEFAULT 1,
+            sort_order INTEGER DEFAULT 0, created_at TEXT)""",
     ]
     for s in stmts:
         db_exec(s)
@@ -274,6 +290,20 @@ def init_db():
             "INSERT INTO settings(key, value) VALUES('stock', ?)",
             (str(INITIAL_STOCK),),
         )
+    _ensure_column("orders", "product_id", "INTEGER DEFAULT 0")
+    _ensure_column("subscriptions", "product_id", "INTEGER DEFAULT 0")
+    if db_one("SELECT id FROM products LIMIT 1") is None:
+        db_exec(
+            "INSERT INTO products(name, price_stars, mrp_text, description, validity_days, "
+            "warranty_days, stock, photo_file_id, is_active, sort_order, created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,1,1,?)",
+            (
+                PRODUCT_NAME, PRICE_STARS, "₹599", SEED_PRODUCT_DESC or PRODUCT_TEXT,
+                VALIDITY_DAYS, WARRANTY_DAYS, get_stock(),
+                get_setting("product_photo_file_id", "") or "", to_iso(now_utc()),
+            ),
+        )
+        log.info("Products table khali thi — ElevenLabs product seed kar diya.")
     log.info("DB ready (%s). Admins: %s | Group: %s", "Postgres" if USE_PG else "SQLite", ADMIN_IDS, GROUP_ID)
 
 
@@ -302,6 +332,13 @@ def fmt_dt(s) -> str:
     if not dt:
         return "-"
     return dt.astimezone(IST).strftime("%d %b %Y, %I:%M %p")
+
+
+def _to_int(s):
+    try:
+        return int(str(s).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def days_left(end_iso) -> int:
@@ -338,6 +375,59 @@ def set_stock(n: int):
 def get_setting(key, default=None):
     row = db_one("SELECT value FROM settings WHERE key=?", (key,))
     return row["value"] if row else default
+
+
+# --------------------------------------------------------------------------- #
+# Products — sab kuch DATABASE me hai. Admin bot se hi add/edit karta hai,
+# naya product turant store me LIVE ho jata hai (code change ki zaroorat nahi).
+# --------------------------------------------------------------------------- #
+def get_products(active_only=False):
+    if active_only:
+        return db_all("SELECT * FROM products WHERE is_active=1 ORDER BY sort_order ASC, id ASC")
+    return db_all("SELECT * FROM products ORDER BY sort_order ASC, id ASC")
+
+
+def get_product(pid):
+    if not pid:
+        return None
+    try:
+        return db_one("SELECT * FROM products WHERE id=?", (int(pid),))
+    except (TypeError, ValueError):
+        return None
+
+
+def get_product_by_name(name):
+    if not name:
+        return None
+    return db_one("SELECT * FROM products WHERE name=?", (name,))
+
+
+def default_product():
+    ps = get_products(active_only=True)
+    return ps[0] if ps else None
+
+
+def set_product_stock(pid, n):
+    db_exec("UPDATE products SET stock=? WHERE id=?", (max(0, int(n)), int(pid)))
+
+
+def total_stock() -> int:
+    row = db_one("SELECT COALESCE(SUM(stock),0) AS s FROM products")
+    return int(row["s"]) if row else 0
+
+
+def terms_text(p=None) -> str:
+    if not p:
+        return TERMS_TEXT
+    return (
+        "📜 <b>Terms — kharidne se pehle padh lo</b>\n\n"
+        f"1️⃣ Ye ek digital subscription hai — {p['name']}.\n"
+        f"2️⃣ Validity {p['validity_days']} din aur Warranty {p['warranty_days']} din <b>delivery ke time</b> se ginni jayegi.\n"
+        "3️⃣ <b>Refund policy nahi hai.</b> Koi dikkat aaye to Warranty period me <b>Replacement</b> milega — Report option se Order ID ke saath report karo.\n"
+        "4️⃣ Account ka galat use (spam, resale, sharing rules todna) karne pe account band ho sakta hai — uski zimmedari store ki nahi hogi.\n"
+        "5️⃣ Ek order = ek subscription. Order kisi aur ko transfer nahi hoga.\n\n"
+        "Agree karte ho to neeche wala button dabao — phir payment khulega."
+    )
 
 
 def is_admin(user_id: int) -> bool:
@@ -401,8 +491,12 @@ async def is_group_member(
 # Keyboards & screens
 # --------------------------------------------------------------------------- #
 def home_kb(user_id: int) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(f"🎙️ {PRODUCT_NAME} — ⭐{PRICE_STARS}", callback_data="nav:product")],
+    rows = []
+    for prod in get_products(active_only=True):
+        rows.append([InlineKeyboardButton(f"🛍️ {prod['name']} — ⭐{prod['price_stars']}", callback_data=f"nav:product:{prod['id']}")])
+    if not rows:
+        rows.append([InlineKeyboardButton("🛍️ Products jald aa rahe hain…", callback_data="noop")])
+    rows += [
         [
             InlineKeyboardButton("📦 My Orders", callback_data="nav:myorders"),
             InlineKeyboardButton("💎 My Subscription", callback_data="nav:mysub"),
@@ -451,37 +545,52 @@ def back_kb(target="nav:home", label="🏠 Home"):
     return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=target)]])
 
 
-def product_kb() -> InlineKeyboardMarkup:
-    stock = get_stock()
+def product_kb(prod) -> InlineKeyboardMarkup:
     rows = []
-    if stock > 0:
-        rows.append([InlineKeyboardButton(f"⭐ Buy Now — {PRICE_STARS} Stars", callback_data="buy:start")])
+    if int(prod["stock"]) > 0:
+        rows.append([InlineKeyboardButton(f"⭐ Buy Now — {prod['price_stars']} Stars", callback_data=f"buy:start:{prod['id']}")])
     else:
         rows.append([InlineKeyboardButton("❌ Out of Stock", callback_data="noop")])
     rows.append([InlineKeyboardButton("🏠 Home", callback_data="nav:home")])
     return InlineKeyboardMarkup(rows)
 
 
-def product_text() -> str:
-    stock = get_stock()
+def product_text(prod) -> str:
+    stock = int(prod["stock"])
     stock_line = "📦 <b>Stock: Available ✅</b>" if stock > 0 else "📦 <b>Stock: Khatm ❌</b> — thoda wait karo, refill hote hi khulega."
+    if prod.get("mrp_text"):
+        price_line = f"💰 Price: <s>{prod['mrp_text']}</s> <b>⭐{prod['price_stars']} Stars</b>"
+    else:
+        price_line = f"💰 Price: <b>⭐{prod['price_stars']} Stars</b>"
+    desc = (prod.get("description") or "").strip() or f"🛍️ <b>{prod['name']}</b>"
     return (
-        PRODUCT_TEXT
+        desc
+        + f"\n\n⏳ <b>Validity: {prod['validity_days']} Days</b> (delivery ke din se)\n"
+        + f"🛡️ <b>Warranty: {prod['warranty_days']} Days</b> (delivery ke din se)\n\n"
         + f"{stock_line}\n\n"
-        + f"💰 Price: <s>₹599</s> <b>⭐{PRICE_STARS} Stars</b>"
+        + price_line
     )
 
 
-async def send_product(chat_send, user_id: int):
-    """Product page photo ke saath bhejo (photo = admin-set file_id ya bundled asset)."""
-    text = product_text()
-    kb = product_kb()
-    photo_id = get_setting("product_photo_file_id")
+async def send_product(chat_send, user_id: int, pid=None):
+    """Product page — photo usi product ki jo database me uske saath judi hai."""
+    prod = get_product(pid) if pid else default_product()
+    if not prod:
+        await chat_send.send_message(
+            "🛍️ Abhi koi product available nahi hai — thoda wait karo!",
+            reply_markup=back_kb(),
+        )
+        return
+    text = product_text(prod)
+    kb = product_kb(prod)
+    photo_id = prod.get("photo_file_id")
     try:
         if photo_id:
             await chat_send.send_photo(photo=photo_id, caption=text, parse_mode="HTML", reply_markup=kb)
             return
-        if os.path.exists(PRODUCT_FILE):
+        # Bundled poster sirf sabse pehle (seed) product ke liye fallback hai
+        first = db_one("SELECT MIN(id) AS m FROM products")
+        if first and int(prod["id"]) == int(first["m"] or 0) and os.path.exists(PRODUCT_FILE):
             with open(PRODUCT_FILE, "rb") as f:
                 await chat_send.send_photo(photo=f, caption=text, parse_mode="HTML", reply_markup=kb)
             return
@@ -532,7 +641,7 @@ async def cmd_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await is_group_member(context, user["user_id"]):
         await show_join(update, context)
         return
-    await send_product(context.bot, user["user_id"])
+    await show_home(update, context)
 
 
 async def cmd_paysupport(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -578,12 +687,18 @@ async def cb_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_join(update, context)
             return
         await show_home(update, context)
-    elif data == "nav:product":
+    elif data == "nav:product" or data.startswith("nav:product:"):
+        pid = None
+        if data.startswith("nav:product:"):
+            try:
+                pid = int(data.split(":")[2])
+            except (IndexError, ValueError):
+                pid = None
         try:
             await q.delete_message()
         except Exception:
             pass
-        await send_product(context.bot, user["user_id"])
+        await send_product(context.bot, user["user_id"], pid)
     elif data == "nav:myorders":
         await show_my_orders(update, context, user["user_id"])
     elif data == "nav:mysub":
@@ -676,9 +791,11 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
             f"⏳ Validity: <b>{v_left} din bache</b> ({fmt_dt(sub['validity_end'])} tak)\n"
             f"🛡️ Warranty: <b>{w_left} din bache</b> ({fmt_dt(sub['warranty_end'])} tak)"
         )
+        renew_prod = get_product(sub.get("product_id")) or get_product_by_name(sub.get("product"))
+        renew_price = int(renew_prod["price_stars"]) if renew_prod else PRICE_STARS
         kb = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton(f"🔄 Renew Karo — ⭐{PRICE_STARS}", callback_data="buy:renew")],
+                [InlineKeyboardButton(f"🔄 Renew Karo — ⭐{renew_price}", callback_data="buy:renew")],
                 [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
             ]
         )
@@ -691,17 +808,18 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
 # --------------------------------------------------------------------------- #
 # Stars payment flow
 # --------------------------------------------------------------------------- #
-async def send_stars_invoice(update_or_query, context, user_id: int, kind: str):
+async def send_stars_invoice(update_or_query, context, user_id: int, kind: str, product):
     chat_id = update_or_query.effective_chat.id if hasattr(update_or_query, "effective_chat") else user_id
-    payload = f"{kind}:{user_id}:{int(now_utc().timestamp())}"
+    payload = f"{kind}:{user_id}:{product['id']}:{int(now_utc().timestamp())}"
+    name32 = (product["name"] or "Product")[:32]
     await context.bot.send_invoice(
         chat_id=chat_id,
-        title=f"{PRODUCT_NAME}",
-        description=f"{PRODUCT_NAME} — 40,000 Credits, {VALIDITY_DAYS} Days Validity, {WARRANTY_DAYS} Days Warranty",
+        title=name32,
+        description=f"{product['name']} — {product['validity_days']} Days Validity, {product['warranty_days']} Days Warranty"[:255],
         payload=payload,
         provider_token="",  # Telegram Stars ke liye khali rehta hai
         currency="XTR",
-        prices=[LabeledPrice(f"{PRODUCT_NAME} — {VALIDITY_DAYS} Days", PRICE_STARS)],
+        prices=[LabeledPrice(f"{name32} — {product['validity_days']} Days", int(product["price_stars"]))],
     )
 
 
@@ -717,8 +835,32 @@ async def cb_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_join(update, context)
         return
 
-    kind = "renew" if q.data == "buy:renew" else "new"
+    # Kaunsa product? Renew = subscription wala, Buy = button wala product
+    product = None
+    if q.data == "buy:renew":
+        kind = "renew"
+        sub = db_one(
+            "SELECT * FROM subscriptions WHERE user_id=? AND active=1 ORDER BY id DESC LIMIT 1",
+            (user["user_id"],),
+        )
+        if sub:
+            product = get_product(sub.get("product_id")) or get_product_by_name(sub.get("product"))
+        if not product:
+            product = default_product()
+    elif q.data.startswith("buy:start:"):
+        kind = "new"
+        try:
+            product = get_product(int(q.data.split(":")[2]))
+        except (IndexError, ValueError):
+            product = None
+    else:
+        kind = "new"
+        product = default_product()
+    if not product:
+        await q.answer("❌ Ye product abhi available nahi hai.", show_alert=True)
+        return
     context.user_data["buy_kind"] = kind
+    context.user_data["buy_pid"] = int(product["id"])
 
     # Terms gate: pehli kharid se pehle ek baar terms accept karna hoga
     if not user.get("terms_accepted"):
@@ -729,38 +871,45 @@ async def cb_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ]
         )
         try:
-            await q.edit_message_text(TERMS_TEXT, parse_mode="HTML", reply_markup=kb)
+            await q.edit_message_text(terms_text(product), parse_mode="HTML", reply_markup=kb)
         except BadRequest:
-            await context.bot.send_message(q.message.chat_id, TERMS_TEXT, parse_mode="HTML", reply_markup=kb)
+            await context.bot.send_message(q.message.chat_id, terms_text(product), parse_mode="HTML", reply_markup=kb)
         return
 
-    if get_stock() <= 0:
-        await q.answer("❌ Stock khatm hai! Thoda wait karo.", show_alert=True)
+    if int(product["stock"]) <= 0:
+        await q.answer("❌ Is product ka stock khatm hai! Thoda wait karo.", show_alert=True)
         return
-    await send_stars_invoice(q, context, user["user_id"], kind)
+    await send_stars_invoice(q, context, user["user_id"], kind, product)
 
 
 async def cb_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer("✅ Terms accept ho gaye!")
     db_exec("UPDATE users SET terms_accepted=1 WHERE user_id=?", (q.from_user.id,))
-    if get_stock() <= 0:
-        await q.answer("❌ Stock khatm hai! Thoda wait karo.", show_alert=True)
+    product = get_product(context.user_data.get("buy_pid")) or default_product()
+    if not product or int(product["stock"]) <= 0:
+        await q.answer("❌ Is product ka stock khatm hai! Thoda wait karo.", show_alert=True)
         return
     kind = context.user_data.get("buy_kind", "new")
-    await send_stars_invoice(q, context, q.from_user.id, kind)
+    await send_stars_invoice(q, context, q.from_user.id, kind, product)
 
 
 async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pq = update.pre_checkout_query
     parts = (pq.invoice_payload or "").split(":")
+    product = None
+    if len(parts) >= 4 and parts[2].isdigit():
+        product = get_product(int(parts[2]))
+    if product is None:
+        product = default_product()
     ok = (
-        len(parts) == 3
+        len(parts) >= 3
         and parts[1].isdigit()
         and int(parts[1]) == pq.from_user.id
         and pq.currency == "XTR"
-        and pq.total_amount == PRICE_STARS
-        and get_stock() > 0
+        and product is not None
+        and pq.total_amount == int(product["price_stars"])
+        and int(product["stock"]) > 0
     )
     if ok:
         await pq.answer(ok=True)
@@ -780,13 +929,19 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     parts = (sp.invoice_payload or "new").split(":")
     kind = parts[0] if parts and parts[0] in ("new", "renew") else "new"
+    product = None
+    if len(parts) >= 4 and parts[2].isdigit():
+        product = get_product(int(parts[2]))
+    if product is None:
+        product = default_product()
 
     oid = db_insert(
-        "INSERT INTO orders(user_id, product, kind, stars, charge_id, provider_charge_id, status, created_at) "
-        "VALUES(?,?,?,?,?,?, 'pending', ?)",
+        "INSERT INTO orders(user_id, product, product_id, kind, stars, charge_id, provider_charge_id, status, created_at) "
+        "VALUES(?,?,?,?,?,?,?, 'pending', ?)",
         (
             user["user_id"],
-            PRODUCT_NAME,
+            product["name"] if product else PRODUCT_NAME,
+            int(product["id"]) if product else 0,
             kind,
             sp.total_amount,
             sp.telegram_payment_charge_id,
@@ -794,8 +949,8 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
             to_iso(now_utc()),
         ),
     )
-    if get_stock() > 0:
-        set_stock(get_stock() - 1)
+    if product and int(product["stock"]) > 0:
+        set_product_stock(product["id"], int(product["stock"]) - 1)
 
     code = order_code(oid)
     deadline = (now_utc() + timedelta(hours=DELIVERY_HOURS)).astimezone(IST).strftime("%I:%M %p")
@@ -859,22 +1014,27 @@ async def do_delivery(context: ContextTypes.DEFAULT_TYPE, oid: int, admin_msg, n
         "UPDATE orders SET status='delivered', delivered_at=?, delivery_note=? WHERE id=?",
         (to_iso(delivered_at), note_text[:200] if note_text else "", oid),
     )
+    # Validity/Warranty ORDER WALE PRODUCT ke hisaab se (delivery ke din se)
+    prod = get_product(o.get("product_id")) or get_product_by_name(o.get("product"))
+    v_days = int(prod["validity_days"]) if prod else VALIDITY_DAYS
+    w_days = int(prod["warranty_days"]) if prod else WARRANTY_DAYS
     # Purani active subscription band karo, nayi banao (dates delivery se)
     db_exec("UPDATE subscriptions SET active=0 WHERE user_id=? AND active=1", (o["user_id"],))
-    validity_end = delivered_at + timedelta(days=VALIDITY_DAYS)
-    warranty_end = delivered_at + timedelta(days=WARRANTY_DAYS)
+    validity_end = delivered_at + timedelta(days=v_days)
+    warranty_end = delivered_at + timedelta(days=w_days)
     db_insert(
-        "INSERT INTO subscriptions(user_id, order_id, product, delivered_at, validity_end, warranty_end) "
-        "VALUES(?,?,?,?,?,?)",
-        (o["user_id"], oid, o["product"], to_iso(delivered_at), to_iso(validity_end), to_iso(warranty_end)),
+        "INSERT INTO subscriptions(user_id, order_id, product, product_id, delivered_at, validity_end, warranty_end) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (o["user_id"], oid, o["product"], int(prod["id"]) if prod else int(o.get("product_id") or 0),
+         to_iso(delivered_at), to_iso(validity_end), to_iso(warranty_end)),
     )
 
     header = (
         "✅ <b>Delivery Ho Gayi!</b>\n\n"
         f"Order ID: <b>{order_code(oid)}</b>\n"
         f"Product: {o['product']}\n"
-        f"⏳ Validity: {fmt_dt(to_iso(validity_end))} tak ({VALIDITY_DAYS} din)\n"
-        f"🛡️ Warranty: {fmt_dt(to_iso(warranty_end))} tak ({WARRANTY_DAYS} din)\n"
+        f"⏳ Validity: {fmt_dt(to_iso(validity_end))} tak ({v_days} din)\n"
+        f"🛡️ Warranty: {fmt_dt(to_iso(warranty_end))} tak ({w_days} din)\n"
         "⬇️ <b>Tumhara Access:</b>\n"
     )
     try:
@@ -1068,13 +1228,12 @@ def admin_panel_kb():
             [InlineKeyboardButton("📋 Pending Orders", callback_data="admin:pending")],
             [
                 InlineKeyboardButton("📊 Stats", callback_data="admin:stats"),
-                InlineKeyboardButton("📦 Stock", callback_data="admin:stock"),
+                InlineKeyboardButton("🛍️ Products", callback_data="admin:products"),
             ],
             [
                 InlineKeyboardButton("🚨 Open Reports", callback_data="admin:reports"),
                 InlineKeyboardButton("📣 Broadcast", callback_data="admin:broadcast"),
             ],
-            [InlineKeyboardButton("🖼️ Product Photo Set Karo", callback_data="admin:setphoto")],
             [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
         ]
     )
@@ -1087,7 +1246,8 @@ async def send_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔐 <b>Admin Panel — Apna AI Store</b>\n\n"
         f"⏳ Pending Orders: <b>{pending}</b>\n"
         f"🚨 Open Reports: <b>{open_reps}</b>\n"
-        f"📦 Stock: <b>{get_stock()}</b>"
+        f"🛍️ Products: <b>{len(get_products())}</b>\n"
+        f"📦 Kul Stock: <b>{total_stock()}</b>"
     )
     if update.callback_query:
         try:
@@ -1096,6 +1256,111 @@ async def send_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except BadRequest:
             pass
     await context.bot.send_message(update.effective_chat.id, text, parse_mode="HTML", reply_markup=admin_panel_kb())
+
+
+async def _show_products_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    prods = get_products()
+    lines = ["🛍️ <b>Products Manager</b>\n"]
+    rows = []
+    if not prods:
+        lines.append("Abhi koi product nahi hai — neeche se pehla add karo.")
+    for pr in prods:
+        state = "✅ LIVE" if pr["is_active"] else "🙈 Hidden"
+        lines.append(f"• <b>{pr['name']}</b> — ⭐{pr['price_stars']} • Stock {pr['stock']} • {state}")
+        rows.append([InlineKeyboardButton(f"⚙️ Manage: {pr['name'][:26]}", callback_data=f"admin:prod:{pr['id']}")])
+    rows.append([InlineKeyboardButton("➕ Naya Product Add Karo", callback_data="admin:prodadd")])
+    rows.append([InlineKeyboardButton("🔐 Admin Panel", callback_data="admin:panel")])
+    text = "\n".join(lines)
+    kb = InlineKeyboardMarkup(rows)
+    try:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    except BadRequest:
+        await context.bot.send_message(q.message.chat_id, text, parse_mode="HTML", reply_markup=kb)
+
+
+async def _show_product_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, pid: int):
+    q = update.callback_query
+    pr = get_product(pid)
+    if not pr:
+        await q.answer("Product nahi mila.", show_alert=True)
+        return
+    state = "✅ LIVE — store me dikh raha hai" if pr["is_active"] else "🙈 HIDDEN — store me nahi dikh raha"
+    text = (
+        f"🛍️ <b>{pr['name']}</b>\n\n"
+        f"⭐ Daam: <b>{pr['price_stars']} Stars</b>\n"
+        f"🏷️ Asli Daam (cut wala): {pr['mrp_text'] or '-'}\n"
+        f"📦 Stock: <b>{pr['stock']}</b>\n"
+        f"⏳ Validity: {pr['validity_days']} din • 🛡️ Warranty: {pr['warranty_days']} din\n"
+        f"🖼️ Photo: {'lagi hai ✅' if pr['photo_file_id'] else 'nahi lagi'}\n"
+        f"📌 Haalat: {state}\n\n"
+        "Jo badalna hai, uska button dabao 👇"
+    )
+    toggle = (
+        InlineKeyboardButton("🙈 Hide Karo", callback_data=f"admin:prodhide:{pid}")
+        if pr["is_active"]
+        else InlineKeyboardButton("✅ Store Me Dikhao", callback_data=f"admin:prodshow:{pid}")
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✏️ Naam", callback_data=f"admin:prodedit:name:{pid}"),
+             InlineKeyboardButton("⭐ Daam", callback_data=f"admin:prodedit:price_stars:{pid}")],
+            [InlineKeyboardButton("📝 Details", callback_data=f"admin:prodedit:description:{pid}"),
+             InlineKeyboardButton("🏷️ Asli Daam", callback_data=f"admin:prodedit:mrp_text:{pid}")],
+            [InlineKeyboardButton("⏳ Validity", callback_data=f"admin:prodedit:validity_days:{pid}"),
+             InlineKeyboardButton("🛡️ Warranty", callback_data=f"admin:prodedit:warranty_days:{pid}")],
+            [InlineKeyboardButton("📦 Stock Set", callback_data=f"admin:prodstock:set:{pid}"),
+             InlineKeyboardButton("➕ Stock Add", callback_data=f"admin:prodstock:add:{pid}")],
+            [InlineKeyboardButton("🖼️ Photo Badlo", callback_data=f"admin:prodphoto:{pid}")],
+            [toggle, InlineKeyboardButton("🗑️ Delete", callback_data=f"admin:proddel:{pid}")],
+            [InlineKeyboardButton("🛍️ Products List", callback_data="admin:products"),
+             InlineKeyboardButton("🔐 Admin Panel", callback_data="admin:panel")],
+        ]
+    )
+    try:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    except BadRequest:
+        await context.bot.send_message(q.message.chat_id, text, parse_mode="HTML", reply_markup=kb)
+
+
+async def _finalize_product_wizard(update: Update, context: ContextTypes.DEFAULT_TYPE, photo_file_id):
+    draft = context.user_data.pop("prod_draft", {}) or {}
+    context.user_data.pop("awaiting", None)
+    chat_id = update.effective_chat.id
+    if not draft.get("name"):
+        await context.bot.send_message(chat_id, "⚠️ Product adhoora reh gaya — Products Manager se dobara add karo.")
+        return
+    maxord = db_one("SELECT COALESCE(MAX(sort_order),0) AS m FROM products")
+    db_insert(
+        "INSERT INTO products(name, price_stars, mrp_text, description, validity_days, warranty_days, "
+        "stock, photo_file_id, is_active, sort_order, created_at) VALUES(?,?,?,?,?,?,?,?,1,?,?)",
+        (
+            draft["name"], draft["price"], draft.get("mrp", ""), draft.get("desc", ""),
+            draft["validity"], draft["warranty"], draft["stock"], photo_file_id or "",
+            int(maxord["m"]) + 1, to_iso(now_utc()),
+        ),
+    )
+    text = (
+        f"✅ <b>{draft['name']}</b> — store me <b>LIVE</b> ho gaya! 🎉\n\n"
+        f"⭐ Daam: {draft['price']} Stars\n"
+        f"📦 Stock: {draft['stock']}\n"
+        f"⏳ Validity {draft['validity']} din • 🛡️ Warranty {draft['warranty']} din\n\n"
+        "Home screen pe iska button abhi se dikhega — bot.py chhedne ki koi zaroorat nahi. 😎"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🛍️ Products Manager", callback_data="admin:products")],
+            [InlineKeyboardButton("🔐 Admin Panel", callback_data="admin:panel")],
+        ]
+    )
+    if photo_file_id:
+        await context.bot.send_photo(
+            chat_id, photo=photo_file_id,
+            caption=text + "\n\n🖼️ Ye photo ISI product ke saath judi hai.",
+            parse_mode="HTML", reply_markup=kb,
+        )
+    else:
+        await context.bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
 
 
 async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1154,33 +1419,115 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👥 Total Users: <b>{users_c}</b>\n"
             f"🧾 Total Orders: <b>{orders_c}</b> (Delivered: {delivered})\n"
             f"⭐ Total Stars Earned: <b>{stars_sum}</b>{bal_line}\n"
-            f"📦 Stock Bacha: <b>{get_stock()}</b>",
+            f"📦 Kul Stock Bacha: <b>{total_stock()}</b>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Admin Panel", callback_data="admin:panel")]]),
         )
 
-    elif data == "admin:stock":
-        kb = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("✏️ Stock Set Karo", callback_data="admin:stockset")],
-                [InlineKeyboardButton("➕ Stock Add Karo", callback_data="admin:stockadd")],
-                [InlineKeyboardButton("🔐 Admin Panel", callback_data="admin:panel")],
-            ]
-        )
-        await q.edit_message_text(f"📦 <b>Stock</b>\n\nAbhi stock: <b>{get_stock()}</b>", parse_mode="HTML", reply_markup=kb)
+    elif data in ("admin:products", "admin:stock", "admin:setphoto"):
+        await _show_products_list(update, context)
 
-    elif data in ("admin:stockset", "admin:stockadd"):
-        mode = "set" if data.endswith("stockset") else "add"
-        context.user_data["awaiting"] = {"kind": "stock", "mode": mode}
+    elif data == "admin:prodadd":
+        context.user_data["prod_draft"] = {}
+        context.user_data["awaiting"] = {"kind": "pw_name"}
         await context.bot.send_message(
             q.from_user.id,
-            "🔢 Sirf <b>number</b> bhejo — " + ("utna stock SET ho jayega." if mode == "set" else "utna stock ADD ho jayega."),
+            "🆕 <b>Naya Product — Step 1/8: Naam</b>\n\n"
+            "Product ka <b>naam</b> bhejo:\n(jaise: <i>ChatGPT Plus — 1 Month</i>)\n\nCancel karna ho to /cancel bhejo.",
             parse_mode="HTML",
         )
 
-    elif data == "admin:setphoto":
-        context.user_data["awaiting"] = {"kind": "product_photo"}
-        await context.bot.send_message(q.from_user.id, "🖼️ Product ki nayi photo bhejo — product page pe wahi dikhegi.")
+    elif data.startswith("admin:prod:"):
+        await _show_product_detail(update, context, int(data.split(":")[2]))
+
+    elif data.startswith("admin:prodhide:") or data.startswith("admin:prodshow:"):
+        pid = int(data.split(":")[2])
+        hide = data.startswith("admin:prodhide:")
+        db_exec("UPDATE products SET is_active=? WHERE id=?", (0 if hide else 1, pid))
+        await q.answer("🙈 Product hide ho gaya — store me nahi dikhega." if hide else "✅ Product LIVE ho gaya — store me dikhega!")
+        await _show_product_detail(update, context, pid)
+
+    elif data.startswith("admin:prodedit:"):
+        parts = data.split(":")
+        field, pid = parts[2], int(parts[3])
+        prod = get_product(pid)
+        if not prod:
+            await q.answer("Product nahi mila.", show_alert=True)
+            return
+        prompts = {
+            "name": f"✏️ <b>{prod['name']}</b> ka naya <b>naam</b> bhejo:",
+            "price_stars": f"⭐ <b>{prod['name']}</b> ka naya <b>daam (Stars)</b> — sirf number bhejo:",
+            "mrp_text": f"🏷️ <b>{prod['name']}</b> ka <b>asli (cut wala) daam</b> bhejo — jaise ₹599. Hatana ho to sirf - bhejo:",
+            "description": f"📝 <b>{prod['name']}</b> ki nayi <b>details/description</b> likh ke bhejo (kai line bhi chalega). Khali rakhna ho to - bhejo:",
+            "validity_days": f"⏳ <b>{prod['name']}</b> ki <b>Validity kitne din</b>? Sirf number bhejo:",
+            "warranty_days": f"🛡️ <b>{prod['name']}</b> ki <b>Warranty kitne din</b>? Sirf number bhejo:",
+        }
+        context.user_data["awaiting"] = {"kind": "pe_field", "pid": pid, "field": field}
+        await context.bot.send_message(q.from_user.id, prompts[field], parse_mode="HTML")
+
+    elif data.startswith("admin:prodstock:"):
+        parts = data.split(":")
+        mode, pid = parts[2], int(parts[3])
+        prod = get_product(pid)
+        if not prod:
+            await q.answer("Product nahi mila.", show_alert=True)
+            return
+        context.user_data["awaiting"] = {"kind": "pe_stock", "pid": pid, "mode": mode}
+        await context.bot.send_message(
+            q.from_user.id,
+            f"📦 <b>{prod['name']}</b> — abhi stock: <b>{prod['stock']}</b>\n"
+            + ("🔢 Kitna stock <b>SET</b> karna hai? Sirf number bhejo:" if mode == "set" else "🔢 Kitna stock <b>ADD</b> karna hai? Sirf number bhejo:"),
+            parse_mode="HTML",
+        )
+
+    elif data.startswith("admin:prodphoto:"):
+        pid = int(data.split(":")[2])
+        prod = get_product(pid)
+        if not prod:
+            await q.answer("Product nahi mila.", show_alert=True)
+            return
+        context.user_data["awaiting"] = {"kind": "pe_photo", "pid": pid}
+        await context.bot.send_message(
+            q.from_user.id,
+            f"🖼️ <b>{prod['name']}</b> ki photo bhejo —\njo photo bhejoge wahi <b>sirf isi product</b> pe lagegi, dusre product ki photo se koi lena-dena nahi.",
+            parse_mode="HTML",
+        )
+
+    elif data.startswith("admin:proddelok:"):
+        pid = int(data.split(":")[2])
+        db_exec("DELETE FROM products WHERE id=?", (pid,))
+        await q.answer("🗑️ Product delete ho gaya.")
+        await _show_products_list(update, context)
+
+    elif data.startswith("admin:proddel:"):
+        pid = int(data.split(":")[2])
+        prod = get_product(pid)
+        if not prod:
+            await q.answer("Product nahi mila.", show_alert=True)
+            return
+        orders_c = db_one("SELECT COUNT(*) AS c FROM orders WHERE product_id=?", (pid,))["c"]
+        if orders_c:
+            await q.edit_message_text(
+                f"⚠️ <b>{prod['name']}</b> delete <b>nahi</b> ho sakta — iske {orders_c} order pehle se jude hain (unka record rakhna zaroori hai).\n\n"
+                "Bechna band karna hai to <b>Hide</b> kar do — store se gayab ho jayega, purane customers ka data safe rahega.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Product Pe Wapas", callback_data=f"admin:prod:{pid}")]]),
+            )
+        else:
+            await q.edit_message_text(
+                f"🗑️ <b>Pakka delete kar dun?</b>\n\nProduct: <b>{prod['name']}</b>\nYe wapas nahi aayega.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("🗑️ Haan, Pakka Delete", callback_data=f"admin:proddelok:{pid}")],
+                        [InlineKeyboardButton("↩️ Nahi, Wapas", callback_data=f"admin:prod:{pid}")],
+                    ]
+                ),
+            )
+
+    elif data == "prodwiz:skip":
+        if context.user_data.get("awaiting", {}).get("kind") == "pw_photo":
+            await _finalize_product_wizard(update, context, None)
 
     elif data == "admin:broadcast":
         context.user_data["awaiting"] = {"kind": "broadcast"}
@@ -1257,6 +1604,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --------------------------------------------------------------------------- #
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("awaiting", None)
+    context.user_data.pop("prod_draft", None)
     await update.message.reply_text("❌ Cancel ho gaya.")
 
 
@@ -1296,6 +1644,149 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---- Neeche wale sirf ADMIN ke liye ----
     if not is_admin(uid):
         context.user_data.pop("awaiting", None)
+        return
+
+    # ---- Naya Product Wizard (step-by-step, sab bot se) ----
+    if kind == "pw_name":
+        if not (msg.text and msg.text.strip()):
+            await msg.reply_text("✍️ Product ka naam likh ke bhejo.")
+            return
+        context.user_data.setdefault("prod_draft", {})["name"] = msg.text.strip()[:60]
+        context.user_data["awaiting"] = {"kind": "pw_price"}
+        await msg.reply_text("🆕 <b>Step 2/8 — Daam</b>\n\nKitne <b>Stars</b> me bechna hai? Sirf number bhejo (jaise: 150)", parse_mode="HTML")
+        return
+
+    if kind == "pw_price":
+        n = _to_int(msg.text) if msg.text else None
+        if n is None or n < 1 or n > 100000:
+            await msg.reply_text("🔢 Sirf sahi number bhejo (1 se 100000 ke beech).")
+            return
+        context.user_data.setdefault("prod_draft", {})["price"] = n
+        context.user_data["awaiting"] = {"kind": "pw_mrp"}
+        await msg.reply_text("🆕 <b>Step 3/8 — Asli Daam (cut wala)</b>\n\nMRP jaisa dikhana hai to bhejo (jaise: ₹599).\nNahi dikhana to sirf <b>-</b> bhejo.", parse_mode="HTML")
+        return
+
+    if kind == "pw_mrp":
+        t = (msg.text or "").strip()
+        context.user_data.setdefault("prod_draft", {})["mrp"] = "" if t == "-" else t[:30]
+        context.user_data["awaiting"] = {"kind": "pw_validity"}
+        await msg.reply_text("🆕 <b>Step 4/8 — Validity</b>\n\nValidity kitne <b>din</b> ki hai? Sirf number bhejo (jaise: 30)", parse_mode="HTML")
+        return
+
+    if kind == "pw_validity":
+        n = _to_int(msg.text) if msg.text else None
+        if n is None or n < 0 or n > 3650:
+            await msg.reply_text("🔢 Sirf number bhejo (0 se 3650 ke beech).")
+            return
+        context.user_data.setdefault("prod_draft", {})["validity"] = n
+        context.user_data["awaiting"] = {"kind": "pw_warranty"}
+        await msg.reply_text("🆕 <b>Step 5/8 — Warranty</b>\n\nWarranty kitne <b>din</b> ki hai? Sirf number bhejo (jaise: 25)", parse_mode="HTML")
+        return
+
+    if kind == "pw_warranty":
+        n = _to_int(msg.text) if msg.text else None
+        if n is None or n < 0 or n > 3650:
+            await msg.reply_text("🔢 Sirf number bhejo (0 se 3650 ke beech).")
+            return
+        context.user_data.setdefault("prod_draft", {})["warranty"] = n
+        context.user_data["awaiting"] = {"kind": "pw_stock"}
+        await msg.reply_text("🆕 <b>Step 6/8 — Stock</b>\n\nShuru me <b>stock</b> kitna rakhun? Sirf number bhejo (jaise: 10)", parse_mode="HTML")
+        return
+
+    if kind == "pw_stock":
+        n = _to_int(msg.text) if msg.text else None
+        if n is None or n < 0 or n > 1000000:
+            await msg.reply_text("🔢 Sirf number bhejo (0 ya zyada).")
+            return
+        context.user_data.setdefault("prod_draft", {})["stock"] = n
+        context.user_data["awaiting"] = {"kind": "pw_desc"}
+        await msg.reply_text("🆕 <b>Step 7/8 — Details</b>\n\nProduct ki <b>details/description</b> likho — features wagera jo customer ko dikhana hai (kai line bhi chalega).\nKuch nahi likhna to sirf <b>-</b> bhejo.", parse_mode="HTML")
+        return
+
+    if kind == "pw_desc":
+        t = (msg.text or "").strip()
+        context.user_data.setdefault("prod_draft", {})["desc"] = "" if t == "-" else t[:1500]
+        context.user_data["awaiting"] = {"kind": "pw_photo"}
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭️ Photo Nahi Hai — Skip Karo", callback_data="prodwiz:skip")]])
+        draft_name = context.user_data.get("prod_draft", {}).get("name", "is product")
+        await msg.reply_text(
+            f"🆕 <b>Step 8/8 — Photo</b>\n\n<b>{draft_name}</b> ki <b>photo bhejo</b> 📸 — jo photo bhejoge wahi isi product pe lagegi.\nPhoto nahi hai to Skip dabao:",
+            parse_mode="HTML", reply_markup=kb,
+        )
+        return
+
+    if kind == "pw_photo":
+        if msg.photo:
+            await _finalize_product_wizard(update, context, msg.photo[-1].file_id)
+        else:
+            await msg.reply_text("📸 Photo bhejo, ya upar wala Skip button dabao.")
+        return
+
+    # ---- Product Edit (per-product) ----
+    if kind == "pe_field":
+        field = state.get("field")
+        pid = state.get("pid")
+        prod = get_product(pid)
+        if not prod or field not in ("name", "price_stars", "mrp_text", "description", "validity_days", "warranty_days"):
+            context.user_data.pop("awaiting", None)
+            return
+        if field in ("price_stars", "validity_days", "warranty_days"):
+            n = _to_int(msg.text) if msg.text else None
+            lo, hi = (1, 100000) if field == "price_stars" else (0, 3650)
+            if n is None or n < lo or n > hi:
+                await msg.reply_text(f"🔢 Sirf sahi number bhejo ({lo} se {hi} ke beech).")
+                return
+            val = n
+        else:
+            t = (msg.text or "").strip()
+            if field == "name":
+                if not t:
+                    await msg.reply_text("✍️ Naam khali nahi ho sakta — naam likh ke bhejo.")
+                    return
+                val = t[:60]
+            elif field == "mrp_text":
+                val = "" if t == "-" else t[:30]
+            else:  # description
+                val = "" if t == "-" else t[:1500]
+        db_exec(f"UPDATE products SET {field}=? WHERE id=?", (val, pid))
+        context.user_data.pop("awaiting", None)
+        labels = {"name": "Naam", "price_stars": "Daam", "mrp_text": "Asli daam", "description": "Details", "validity_days": "Validity", "warranty_days": "Warranty"}
+        await msg.reply_text(f"✅ <b>{prod['name']}</b> ka <b>{labels[field]}</b> badal gaya — store me turant LIVE hai. 🎉", parse_mode="HTML")
+        return
+
+    if kind == "pe_stock":
+        pid = state.get("pid")
+        prod = get_product(pid)
+        n = _to_int(msg.text) if msg.text else None
+        if not prod:
+            context.user_data.pop("awaiting", None)
+            return
+        if n is None or n < 0 or n > 1000000:
+            await msg.reply_text("🔢 Sirf number bhejo (0 ya zyada).")
+            return
+        new_stock = int(prod["stock"]) + n if state.get("mode") == "add" else n
+        set_product_stock(pid, new_stock)
+        context.user_data.pop("awaiting", None)
+        await msg.reply_text(f"✅ <b>{prod['name']}</b> ka stock ab: <b>{new_stock}</b>", parse_mode="HTML")
+        return
+
+    if kind == "pe_photo":
+        pid = state.get("pid")
+        prod = get_product(pid)
+        if not prod:
+            context.user_data.pop("awaiting", None)
+            return
+        if msg.photo:
+            fid = msg.photo[-1].file_id
+            db_exec("UPDATE products SET photo_file_id=? WHERE id=?", (fid, pid))
+            context.user_data.pop("awaiting", None)
+            await context.bot.send_photo(
+                msg.chat_id, photo=fid,
+                caption=f"✅ <b>Photo lag gayi!</b>\n\nProduct: <b>{prod['name']}</b>\nAb product page pe yahi photo dikhegi — sirf isi product pe. 👍",
+                parse_mode="HTML",
+            )
+        else:
+            await msg.reply_text("🖼️ Photo bhejo.")
         return
 
     if kind == "deliver":
@@ -1340,32 +1831,6 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await msg.reply_text("✅ Replacement bhej diya, report resolved mark ho gayi.")
             except Exception as e:
                 await msg.reply_text(f"⚠️ Replacement nahi gaya: {e}")
-        return
-
-    if kind == "stock":
-        if not (msg.text and msg.text.strip().lstrip("-").isdigit()):
-            await msg.reply_text("🔢 Sirf number bhejo.")
-            return
-        n = int(msg.text.strip())
-        if state.get("mode") == "add":
-            set_stock(get_stock() + n)
-        else:
-            set_stock(n)
-        context.user_data.pop("awaiting", None)
-        await msg.reply_text(f"✅ Stock update ho gaya. Abhi stock: <b>{get_stock()}</b>", parse_mode="HTML")
-        return
-
-    if kind == "product_photo":
-        if msg.photo:
-            db_exec(
-                "INSERT INTO settings(key, value) VALUES('product_photo_file_id', ?) "
-                + ("ON CONFLICT(key) DO UPDATE SET value=excluded.value" if not USE_PG else "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value"),
-                (msg.photo[-1].file_id,),
-            )
-            context.user_data.pop("awaiting", None)
-            await msg.reply_text("✅ Product photo set ho gayi — product page pe ab yahi dikhegi.")
-        else:
-            await msg.reply_text("🖼️ Photo bhejo.")
         return
 
     if kind == "broadcast":
@@ -1480,7 +1945,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     s["user_id"],
                     f"⏳ Tumhari subscription <b>{days_left(s['validity_end'])} din</b> me expire ho jayegi ({fmt_dt(s['validity_end'])}).\n"
-                    f"Renew karna ho to bot me My Subscription se Renew dabao — ⭐{PRICE_STARS} Stars.",
+                    f"Renew karna ho to bot me My Subscription se Renew dabao — ⭐{(get_product(s.get('product_id')) or get_product_by_name(s.get('product')) or {}).get('price_stars', PRICE_STARS)} Stars.",
                     parse_mode="HTML",
                 )
             except Exception:
@@ -1497,7 +1962,7 @@ async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
         f"🧾 Aaj ke Orders: <b>{len(todays)}</b>\n"
         f"⭐ Aaj ke Stars: <b>{stars}</b>\n"
         f"⏳ Abhi Pending: <b>{pending}</b>\n"
-        f"📦 Stock Bacha: <b>{get_stock()}</b>"
+        f"📦 Kul Stock Bacha: <b>{total_stock()}</b>"
     )
     for aid in ADMIN_IDS:
         try:
@@ -1578,7 +2043,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_buy, pattern="^buy:"))
     app.add_handler(CallbackQueryHandler(cb_order_view, pattern="^order:view:"))
     app.add_handler(CallbackQueryHandler(cb_report, pattern="^report:"))
-    app.add_handler(CallbackQueryHandler(cb_admin, pattern="^admin:"))
+    app.add_handler(CallbackQueryHandler(cb_admin, pattern="^(admin:|prodwiz:)"))
     app.add_handler(CallbackQueryHandler(cb_nav, pattern="^(nav:|noop$)"))
 
     app.add_handler(PreCheckoutQueryHandler(pre_checkout))
