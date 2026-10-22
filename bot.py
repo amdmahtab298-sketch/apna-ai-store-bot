@@ -142,73 +142,106 @@ REPORT_CATEGORIES = {
 # --------------------------------------------------------------------------- #
 USE_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 _lock = threading.Lock()
+_pg_conn = None  # Postgres connection ek baar banta hai, phir reuse hota hai
 
 
 def _connect():
+    global _pg_conn
     if USE_PG:
         import psycopg
         from psycopg.rows import dict_row
 
-        return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+        if _pg_conn is None or _pg_conn.closed:
+            _pg_conn = psycopg.connect(
+                DATABASE_URL,
+                row_factory=dict_row,
+                connect_timeout=15,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=5,
+            )
+        return _pg_conn
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _drop_pg_conn():
+    global _pg_conn
+    try:
+        if _pg_conn is not None:
+            _pg_conn.close()
+    except Exception:
+        pass
+    _pg_conn = None
 
 
 def _q(sql: str) -> str:
     return sql.replace("?", "%s") if USE_PG else sql
 
 
-def db_exec(sql, params=()):
+def _with_conn(work):
+    """work(cur) ko ek connection pe chalao. PG connection REUSE hota hai
+    (har query pe naya connection nahi — bot ki speed yahi se aati hai);
+    connection toota ho to ek baar naya bana ke phir try hota hai."""
     with _lock:
-        conn = _connect()
-        try:
-            cur = conn.cursor()
-            cur.execute(_q(sql), tuple(params))
-            conn.commit()
-        finally:
-            conn.close()
+        for attempt in (0, 1):
+            conn = _connect()
+            try:
+                cur = conn.cursor()
+                out = work(cur)
+                conn.commit()
+                return out
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                if USE_PG and attempt == 0:
+                    _drop_pg_conn()
+                    continue
+                raise
+            finally:
+                if not USE_PG:
+                    conn.close()
+
+
+def db_exec(sql, params=()):
+    def work(cur):
+        cur.execute(_q(sql), tuple(params))
+
+    _with_conn(work)
 
 
 def db_insert(sql, params=()):
     """Insert karke nayi row ka id do."""
-    with _lock:
-        conn = _connect()
-        try:
-            cur = conn.cursor()
-            if USE_PG:
-                cur.execute(_q(sql) + " RETURNING id", tuple(params))
-                new_id = cur.fetchone()["id"]
-            else:
-                cur.execute(_q(sql), tuple(params))
-                new_id = cur.lastrowid
-            conn.commit()
-            return new_id
-        finally:
-            conn.close()
+
+    def work(cur):
+        if USE_PG:
+            cur.execute(_q(sql) + " RETURNING id", tuple(params))
+            return cur.fetchone()["id"]
+        cur.execute(_q(sql), tuple(params))
+        return cur.lastrowid
+
+    return _with_conn(work)
 
 
 def db_one(sql, params=()):
-    with _lock:
-        conn = _connect()
-        try:
-            cur = conn.cursor()
-            cur.execute(_q(sql), tuple(params))
-            row = cur.fetchone()
-            return dict(row) if row else None
-        finally:
-            conn.close()
+    def work(cur):
+        cur.execute(_q(sql), tuple(params))
+        row = cur.fetchone()
+        return dict(row) if row else None
+
+    return _with_conn(work)
 
 
 def db_all(sql, params=()):
-    with _lock:
-        conn = _connect()
-        try:
-            cur = conn.cursor()
-            cur.execute(_q(sql), tuple(params))
-            return [dict(r) for r in cur.fetchall()]
-        finally:
-            conn.close()
+    def work(cur):
+        cur.execute(_q(sql), tuple(params))
+        return [dict(r) for r in cur.fetchall()]
+
+    return _with_conn(work)
 
 
 def init_db():
@@ -327,12 +360,25 @@ def register_user(user) -> dict:
     return row
 
 
-async def is_group_member(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
-    """Force-join check. GROUP_ID set na ho to gate OFF (True)."""
+_member_cache: dict = {}  # user_id -> (is_member, monotonic_ts)
+_MEMBER_TTL = 300  # 5 minute — har tap pe Telegram API nahi (speed)
+
+
+async def is_group_member(
+    context: ContextTypes.DEFAULT_TYPE, user_id: int, force: bool = False
+) -> bool:
+    """Force-join check. GROUP_ID set na ho to gate OFF (True).
+    Aam taps pe 5-min cache; Verify aur Buy pe force=True (taaza check)."""
     if not GROUP_ID:
         return True
     if is_admin(user_id):
         return True
+    import time as _time
+
+    if not force:
+        hit = _member_cache.get(user_id)
+        if hit and (_time.monotonic() - hit[1]) < _MEMBER_TTL:
+            return hit[0]
     try:
         member = await context.bot.get_chat_member(GROUP_ID, user_id)
     except BadRequest as e:
@@ -342,10 +388,13 @@ async def is_group_member(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> b
         log.warning("member check error: %s", e)
         return False
     if member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
-        return True
-    if member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False):
-        return True
-    return False
+        result = True
+    elif member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False):
+        result = True
+    else:
+        result = False
+    _member_cache[user_id] = (result, _time.monotonic())
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -506,7 +555,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cb_join_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if await is_group_member(context, q.from_user.id):
+    if await is_group_member(context, q.from_user.id, force=True):
         await q.answer("✅ Verify ho gaya! Store khul gaya 🚀", show_alert=True)
         await show_home(update, context)
     else:
@@ -664,7 +713,7 @@ async def cb_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.get("is_banned"):
         await q.answer("🚫 Tumhara account banned hai.", show_alert=True)
         return
-    if not await is_group_member(context, user["user_id"]):
+    if not await is_group_member(context, user["user_id"], force=True):
         await show_join(update, context)
         return
 
