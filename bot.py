@@ -2,13 +2,13 @@
 """
 Apna AI Store — Telegram Store Bot
 ===================================
-Ek product ka store: ElevenLabs Starter Plan (Telegram Stars payment).
+Ek product ka store: ElevenLabs Starter Plan (UPI payment — screenshot + admin verify).
 
 Features (locked spec):
 - Force Join: bot tabhi chalega jab user Public Group ka member ho
 - Home screen: Welcome text + inline buttons (LetXShop style, 2-per-row grid)
 - Product page: pura detail (credits, features, validity, warranty, price, live stock)
-- Payment: Telegram Stars (XTR) invoice, delivery sirf successful_payment ke baad
+- Payment: UPI — user screenshot bhejta hai, admin Approve kare tab order confirm; delivery uske baad
 - Manual Delivery: 2-4 ghante (timing sirf payment ke baad show hoti hai)
 - Validity 30 din / Warranty 25 din — delivery time se ginna jata hai
 - My Orders / My Subscription / Renewal reminders
@@ -26,7 +26,7 @@ Config (.env / Render Environment Variables):
   DATABASE_URL   - (optional) Postgres URL. Khali ho to SQLite file use hogi.
                    NOTE: Render free plan pe disk reset hota hai — hamesha
                    ke liye Neon/Supabase ka free Postgres lagana best hai.
-  PRICE_STARS    - Product price in Stars (default 150)
+  PRICE_INR    - Product price rupaye (₹) me (default 199)
   INITIAL_STOCK  - Shuruaat ka stock (default 10)
 """
 
@@ -36,7 +36,7 @@ import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus
 from telegram.error import BadRequest
 from telegram.ext import (
@@ -45,7 +45,6 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
-    PreCheckoutQueryHandler,
     filters,
 )
 
@@ -83,7 +82,7 @@ if GROUP_ID >= 10**12:
     GROUP_ID = -GROUP_ID
 GROUP_LINK = os.environ.get("GROUP_LINK", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
-PRICE_STARS = _env_int("PRICE_STARS", 150)
+PRICE_INR = _env_int("PRICE_INR", 199)
 INITIAL_STOCK = _env_int("INITIAL_STOCK", 10)
 DB_PATH = os.environ.get("DB_PATH", "store.db")
 
@@ -303,7 +302,7 @@ def init_db():
             created_at TEXT)""",
         """CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)""",
         f"""CREATE TABLE IF NOT EXISTS products(
-            id {id_col}, name TEXT, price_stars INTEGER DEFAULT 0, mrp_text TEXT DEFAULT '',
+            id {id_col}, name TEXT, price_inr INTEGER DEFAULT 0, mrp_text TEXT DEFAULT '',
             description TEXT DEFAULT '', validity_days INTEGER DEFAULT 30,
             warranty_days INTEGER DEFAULT 25, stock INTEGER DEFAULT 0,
             photo_file_id TEXT DEFAULT '', is_active INTEGER DEFAULT 1,
@@ -319,13 +318,18 @@ def init_db():
     _ensure_column("products", "stock_mode", "TEXT DEFAULT 'count'")
     _ensure_column("orders", "product_id", "INTEGER DEFAULT 0")
     _ensure_column("subscriptions", "product_id", "INTEGER DEFAULT 0")
+    _ensure_column("products", "price_inr", "INTEGER DEFAULT 0")
+    _ensure_column("orders", "amount_inr", "INTEGER DEFAULT 0")
+    _ensure_column("orders", "pay_shot", "TEXT DEFAULT ''")
+    _ensure_column("orders", "pay_utr", "TEXT DEFAULT ''")
+    db_exec("UPDATE products SET price_inr=? WHERE price_inr IS NULL OR price_inr=0", (PRICE_INR,))
     if db_one("SELECT id FROM products LIMIT 1") is None:
         db_exec(
-            "INSERT INTO products(name, price_stars, mrp_text, description, validity_days, "
+            "INSERT INTO products(name, price_inr, mrp_text, description, validity_days, "
             "warranty_days, stock, photo_file_id, is_active, sort_order, created_at) "
             "VALUES(?,?,?,?,?,?,?,?,1,1,?)",
             (
-                PRODUCT_NAME, PRICE_STARS, "₹599", SEED_PRODUCT_DESC or PRODUCT_TEXT,
+                PRODUCT_NAME, PRICE_INR, "₹599", SEED_PRODUCT_DESC or PRODUCT_TEXT,
                 VALIDITY_DAYS, WARRANTY_DAYS, get_stock(),
                 get_setting("product_photo_file_id", "") or "", to_iso(now_utc()),
             ),
@@ -377,6 +381,14 @@ def days_left(end_iso) -> int:
 
 def order_code(order_id: int) -> str:
     return f"EL{1000 + int(order_id)}"
+
+def status_label(s) -> str:
+    return {
+        "payment_review": "💳 Payment Review Me",
+        "pending": "⏳ Processing",
+        "delivered": "✅ Delivered",
+        "rejected": "❌ Payment Reject",
+    }.get(s or "", (s or "").title())
 
 
 def report_code(report_id: int) -> str:
@@ -564,7 +576,7 @@ async def is_group_member(
 def home_kb(user_id: int) -> InlineKeyboardMarkup:
     rows = []
     for prod in get_products(active_only=True):
-        rows.append([InlineKeyboardButton(f"🛍️ {prod['name']} — ⭐{prod['price_stars']}", callback_data=f"nav:product:{prod['id']}")])
+        rows.append([InlineKeyboardButton(f"🛍️ {prod['name']} — ₹{prod['price_inr']}", callback_data=f"nav:product:{prod['id']}")])
     if not rows:
         rows.append([InlineKeyboardButton("🛍️ Products jald aa rahe hain…", callback_data="noop")])
     rows += [
@@ -589,7 +601,7 @@ def home_text(first_name: str) -> str:
     custom = get_setting("welcome_text")
     body = custom if custom else (
         "🛍️ Browse our premium AI services and choose your plan.\n"
-        "⭐ Pay securely via Telegram Stars\n"
+        "💳 Pay easily via UPI — GPay / PhonePe / Paytm\n"
         "🍀 Trust issues? Visit our Public Group 👥\n\n"
         "Select a product below to get started:"
     )
@@ -640,7 +652,7 @@ def cancel_kb():
 def product_kb(prod) -> InlineKeyboardMarkup:
     rows = []
     if is_in_stock(prod):
-        rows.append([InlineKeyboardButton(f"⭐ Buy Now — {prod['price_stars']} Stars", callback_data=f"buy:start:{prod['id']}")])
+        rows.append([InlineKeyboardButton(f"🛒 Buy Now — ₹{prod['price_inr']}", callback_data=f"buy:start:{prod['id']}")])
     else:
         rows.append([InlineKeyboardButton("❌ Out of Stock", callback_data="noop")])
     rows.append([InlineKeyboardButton("🏠 Home", callback_data="nav:home")])
@@ -650,9 +662,9 @@ def product_kb(prod) -> InlineKeyboardMarkup:
 def product_text(prod) -> str:
     stock_line = "📦 <b>Stock: Available ✅</b>" if is_in_stock(prod) else "📦 <b>Stock: Khatm ❌</b> — thoda wait karo, refill hote hi khulega."
     if prod.get("mrp_text"):
-        price_line = f"💰 Price: <s>{prod['mrp_text']}</s> <b>⭐{prod['price_stars']} Stars</b>"
+        price_line = f"💰 Price: <s>{prod['mrp_text']}</s> <b>₹{prod['price_inr']}</b>"
     else:
-        price_line = f"💰 Price: <b>⭐{prod['price_stars']} Stars</b>"
+        price_line = f"💰 Price: <b>₹{prod['price_inr']}</b>"
     desc = (prod.get("description") or "").strip() or f"🛍️ <b>{prod['name']}</b>"
     return (
         desc
@@ -812,10 +824,10 @@ async def show_my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE, use
         lines = ["📦 <b>My Orders</b>\n"]
         rows = []
         for o in orders:
-            emoji = "⏳" if o["status"] == "pending" else "✅" if o["status"] == "delivered" else "❌"
+            emoji = "⏳" if o["status"] == "pending" else "✅" if o["status"] == "delivered" else "💳" if o["status"] == "payment_review" else "❌"
             lines.append(
                 f"{emoji} <b>{order_code(o['id'])}</b> — {o['product']}\n"
-                f"    ⭐{o['stars']} Stars • {fmt_dt(o['created_at'])} • Status: <b>{o['status'].title()}</b>"
+                f"    ₹{o['amount_inr']} • {fmt_dt(o['created_at'])} • Status: <b>{status_label(o['status'])}</b>"
             )
             rows.append(
                 [
@@ -843,9 +855,9 @@ async def cb_order_view(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [
         f"🧾 <b>Order {order_code(o['id'])}</b>\n",
         f"Product: {o['product']}",
-        f"Paid: ⭐{o['stars']} Stars",
+        f"Paid: ₹{o['amount_inr']}",
         f"Order Time: {fmt_dt(o['created_at'])}",
-        f"Status: <b>{o['status'].title()}</b>",
+        f"Status: <b>{status_label(o['status'])}</b>",
     ]
     if o["status"] == "pending":
         deadline = from_iso(o["created_at"]) + timedelta(hours=DELIVERY_HOURS)
@@ -886,10 +898,10 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
             f"🛡️ Warranty: <b>{w_left} din bache</b> ({fmt_dt(sub['warranty_end'])} tak)"
         )
         renew_prod = get_product(sub.get("product_id")) or get_product_by_name(sub.get("product"))
-        renew_price = int(renew_prod["price_stars"]) if renew_prod else PRICE_STARS
+        renew_price = int(renew_prod["price_inr"]) if renew_prod else PRICE_INR
         kb = InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton(f"🔄 Renew Karo — ⭐{renew_price}", callback_data="buy:renew")],
+                [InlineKeyboardButton(f"🔄 Renew Karo — ₹{renew_price}", callback_data="buy:renew")],
                 [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
             ]
         )
@@ -900,21 +912,245 @@ async def show_my_subscription(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # --------------------------------------------------------------------------- #
-# Stars payment flow
+# UPI payment flow
 # --------------------------------------------------------------------------- #
-async def send_stars_invoice(update_or_query, context, user_id: int, kind: str, product):
-    chat_id = update_or_query.effective_chat.id if hasattr(update_or_query, "effective_chat") else user_id
-    payload = f"{kind}:{user_id}:{product['id']}:{int(now_utc().timestamp())}"
-    name32 = (product["name"] or "Product")[:32]
-    await context.bot.send_invoice(
-        chat_id=chat_id,
-        title=name32,
-        description=f"{product['name']} — {product['validity_days']} Days Validity, {product['warranty_days']} Days Warranty"[:255],
-        payload=payload,
-        provider_token="",  # Telegram Stars ke liye khali rehta hai
-        currency="XTR",
-        prices=[LabeledPrice(f"{name32} — {product['validity_days']} Days", int(product["price_stars"]))],
+async def show_upi_payment(context, user_id: int, kind: str, product):
+    """UPI payment screen: QR photo (agar set hai) + UPI ID + screenshot button.
+    Payment ka koi auto-confirm nahi — user screenshot bhejega, admin Approve
+    karega, tab order confirm hoga."""
+    price = int(product["price_inr"])
+    upi_id = (get_setting("upi_id") or "").strip()
+    qr = (get_setting("pay_qr_file_id") or "").strip()
+    context.user_data["buy_pid"] = int(product["id"])
+    context.user_data["buy_kind"] = kind
+    if not upi_id and not qr:
+        try:
+            await context.bot.send_message(
+                user_id,
+                "🛠️ <b>Payment abhi set ho raha hai</b> — thodi der me dobara try karo. Admin ko khabar bhej di hai. 🙏",
+                parse_mode="HTML", reply_markup=back_kb(),
+            )
+        except Exception:
+            pass
+        for aid in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    aid,
+                    "⚠️ <b>UPI Payment set nahi hai!</b>\nEk customer kharidne aaya tha, lekin UPI ID/QR set nahi hai.\n"
+                    "Admin Panel → ⚙️ Settings → 💳 UPI ID aur 🖼️ Payment QR set karo — warna koi kharid nahi payega!",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        return
+    from urllib.parse import quote
+    text = (
+        "💳 <b>Payment Karo</b>\n\n"
+        f"🛍️ Product: <b>{product['name']}</b>\n"
+        f"💰 Amount: <b>₹{price}</b>\n\n"
     )
+    if upi_id:
+        text += (
+            f"📲 <b>UPI ID:</b> <code>{upi_id}</code>\n"
+            f"(ID pe tap karke copy karo — kisi bhi UPI app GPay / PhonePe / Paytm / BHIM se <b>₹{price}</b> bhejo)\n\n"
+            f"📱 Direct link (copy karke app/browser me kholo):\n"
+            f"<code>upi://pay?pa={upi_id}&amp;pn={quote(get_store_name())}&amp;am={price}&amp;cu=INR</code>\n\n"
+        )
+    text += (
+        "📸 Payment ke baad neeche wala button dabake <b>screenshot bhejna lazmi hai</b> — "
+        "admin verify karega, uske baad hi order confirm hoga."
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Payment Kar Diya — Screenshot Bhejo", callback_data="pay:proof")],
+            [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
+        ]
+    )
+    try:
+        if qr:
+            await context.bot.send_photo(user_id, qr, caption=text, parse_mode="HTML", reply_markup=kb)
+        else:
+            await context.bot.send_message(user_id, text, parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        log.warning("UPI payment screen (photo) fail %s: %s — text bhej raha hu", user_id, e)
+        await context.bot.send_message(user_id, text, parse_mode="HTML", reply_markup=kb)
+
+
+async def finalize_pay_review(context, user_id: int, utr: str):
+    """Screenshot + UTR aa gaya — order 'payment_review' me daalo, admin ko
+    screenshot ke saath Approve/Reject alert bhejo."""
+    product = get_product(context.user_data.get("buy_pid")) or default_product()
+    kind = context.user_data.get("buy_kind", "new")
+    shot = context.user_data.get("pay_shot", "")
+    context.user_data.pop("awaiting", None)
+    if not product or not shot:
+        await context.bot.send_message(
+            user_id, "⚠️ Kuch gadbad ho gayi — product page se dobara Buy dabao.", reply_markup=back_kb()
+        )
+        return
+    existing = db_one(
+        "SELECT * FROM orders WHERE user_id=? AND product_id=? AND status='payment_review' ORDER BY id DESC LIMIT 1",
+        (user_id, int(product["id"])),
+    )
+    if existing:
+        await context.bot.send_message(
+            user_id,
+            f"🧾 Tumhara payment pehle se <b>review me hai</b> (Order <b>{order_code(existing['id'])}</b>) — "
+            "admin ke confirm karte hi yahin khabar milegi. 🙏",
+            parse_mode="HTML",
+        )
+        return
+    oid = db_insert(
+        "INSERT INTO orders(user_id, product, product_id, kind, amount_inr, status, created_at, pay_shot, pay_utr) "
+        "VALUES(?,?,?,?,?,'payment_review',?,?,?)",
+        (user_id, product["name"], int(product["id"]), kind, int(product["price_inr"]),
+         to_iso(now_utc()), shot, utr or ""),
+    )
+    if not oid:
+        row = db_one("SELECT MAX(id) AS m FROM orders")
+        oid = row["m"] if row else 0
+    await context.bot.send_message(
+        user_id,
+        "🧾 <b>Payment mil gaya — Review me hai!</b>\n\n"
+        f"Order ID: <b>{order_code(oid)}</b>\n"
+        f"Amount: ₹{int(product['price_inr'])}\n\n"
+        "Admin tumhara payment verify karke order confirm karega — aam taur par zyada der nahi lagti. "
+        "Confirm hote hi yahin message ayega. 🙏",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📦 My Orders", callback_data="nav:orders")],
+                [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
+            ]
+        ),
+    )
+    u = db_one("SELECT * FROM users WHERE user_id=?", (user_id,)) or {}
+    caption = (
+        "💰 <b>NAYA PAYMENT AAYA — VERIFY KARO!</b>\n\n"
+        f"Order ID: <b>{order_code(oid)}</b>" + (" (RENEWAL)" if kind == "renew" else "") + "\n"
+        f"User: {u.get('first_name', '')} (@{u.get('username', '-')})\n"
+        f"User ID: <code>{user_id}</code>\n"
+        f"Product: {product['name']}\n"
+        f"Amount: <b>₹{int(product['price_inr'])}</b>\n"
+        f"UTR: <code>{utr or '-'}</code>\n\n"
+        "Screenshot dhyaan se dekho — amount aur Successful saaf dikh raha ho tabhi <b>Approve</b> karo."
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Approve — Order Confirm Karo", callback_data=f"payok:{oid}")],
+            [InlineKeyboardButton("❌ Reject — Payment Galat Hai", callback_data=f"payno:{oid}")],
+        ]
+    )
+    for aid in ADMIN_IDS:
+        try:
+            await context.bot.send_photo(aid, shot, caption=caption, parse_mode="HTML", reply_markup=kb)
+        except Exception as e:
+            log.warning("payment alert photo fail %s: %s", aid, e)
+            try:
+                await context.bot.send_message(aid, caption, parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                pass
+
+
+async def approve_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, o):
+    q = update.callback_query
+    db_exec("UPDATE orders SET status='pending' WHERE id=?", (o["id"],))
+    prod = get_product(o.get("product_id"))
+    if prod and (prod.get("stock_mode") or "count") == "count" and int(prod["stock"]) > 0:
+        set_product_stock(prod["id"], int(prod["stock"]) - 1)
+    try:
+        if q.message is not None and q.message.caption:
+            await q.edit_message_caption(caption=q.message.caption + "\n\n✅ <b>APPROVED — order confirm ho gaya!</b>", parse_mode="HTML")
+        else:
+            await context.bot.send_message(q.from_user.id, f"✅ Order {order_code(o['id'])} APPROVE ho gaya.")
+    except Exception:
+        pass
+    deadline = (now_utc() + timedelta(hours=DELIVERY_HOURS)).astimezone(IST).strftime("%I:%M %p")
+    try:
+        await context.bot.send_message(
+            o["user_id"],
+            "🎉 <b>Payment Confirm Ho Gaya!</b>\n\n"
+            f"Order ID: <b>{order_code(o['id'])}</b>\n"
+            f"Paid: ₹{o['amount_inr']} ✅\n"
+            f"⏳ <b>Delivery Time: 2-4 Hours</b> (deadline {deadline})\n"
+            "Status: ⏳ Processing…\n\n"
+            "Delivery isi chat me hogi, tab tak please wait karo. 🙏",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("📦 Order Status Dekho", callback_data=f"order:view:{o['id']}")],
+                    [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
+                ]
+            ),
+        )
+    except Exception as e:
+        log.warning("approve user notify fail: %s", e)
+    await notify_admins_new_order(context, o["id"])
+
+
+async def reject_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, o):
+    q = update.callback_query
+    db_exec("UPDATE orders SET status='rejected' WHERE id=?", (o["id"],))
+    try:
+        if q.message is not None and q.message.caption:
+            await q.edit_message_caption(caption=q.message.caption + "\n\n❌ <b>REJECTED</b>", parse_mode="HTML")
+        else:
+            await context.bot.send_message(q.from_user.id, f"❌ Order {order_code(o['id'])} REJECT ho gaya.")
+    except Exception:
+        pass
+    try:
+        await context.bot.send_message(
+            o["user_id"],
+            "❌ <b>Payment Verify Nahi Ho Paya</b>\n\n"
+            f"Order ID: <b>{order_code(o['id'])}</b>\n"
+            "Tumhare screenshot se payment confirm nahi hua (amount/UTR saaf nahi dikha, ya payment mila nahi).\n\n"
+            "Agar tumne <b>sach me payment kiya hai</b> to ghabrao mat — <b>Public Group</b> me apna screenshot aur Order ID bhejo, admin wahi check karke madad karega.\n"
+            "Dobara kharidna ho to product page se phir se try kar sakte ho.",
+            parse_mode="HTML",
+            reply_markup=back_kb(),
+        )
+    except Exception as e:
+        log.warning("reject user notify fail: %s", e)
+
+
+async def cb_pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    data = q.data
+    if data == "pay:proof":
+        product = get_product(context.user_data.get("buy_pid")) or default_product()
+        if not product:
+            await q.answer("Product nahi mila — Home se dobara try karo.", show_alert=True)
+            return
+        await q.answer()
+        context.user_data["awaiting"] = {"kind": "pay_shot"}
+        await context.bot.send_message(
+            q.from_user.id,
+            "📸 <b>Payment ka screenshot bhejo</b>\n\n"
+            f"Amount <b>₹{int(product['price_inr'])}</b> aur <b>Successful / Completed</b> saaf dikhna chahiye.\n"
+            "Jhoota ya purana screenshot bheja to order reject ho jayega.",
+            parse_mode="HTML", reply_markup=cancel_kb(),
+        )
+        return
+    if data == "pay:utrskip":
+        await q.answer()
+        await finalize_pay_review(context, q.from_user.id, "")
+        return
+    if data.startswith("payok:") or data.startswith("payno:"):
+        if not is_admin(q.from_user.id):
+            await q.answer("🚫 Ye sirf admin ke liye hai.", show_alert=True)
+            return
+        await q.answer()
+        oid = int(data.split(":")[1])
+        o = db_one("SELECT * FROM orders WHERE id=?", (oid,))
+        if not o or o["status"] != "payment_review":
+            await context.bot.send_message(q.from_user.id, "Ye payment review me nahi hai — pehle hi decide ho chuka hai.")
+            return
+        if data.startswith("payok:"):
+            await approve_payment(update, context, o)
+        else:
+            await reject_payment(update, context, o)
+        return
+    await q.answer()
 
 
 async def cb_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -973,97 +1209,25 @@ async def cb_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_in_stock(product):
         await q.answer("❌ Is product ka stock khatm hai! Thoda wait karo.", show_alert=True)
         return
-    await send_stars_invoice(q, context, user["user_id"], kind, product)
+    await show_upi_payment(context, user["user_id"], kind, product)
 
 
 async def cb_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    await q.answer("✅ Terms accept ho gaye!")
+    try:
+        await q.answer("✅ Terms accept ho gaye!")
+    except Exception:
+        pass  # purana query — invoice phir bhi bhejna hai
     db_exec("UPDATE users SET terms_accepted=1 WHERE user_id=?", (q.from_user.id,))
     product = get_product(context.user_data.get("buy_pid")) or default_product()
     if not product or not is_in_stock(product):
-        await q.answer("❌ Is product ka stock khatm hai! Thoda wait karo.", show_alert=True)
+        try:
+            await context.bot.send_message(q.from_user.id, "❌ Is product ka stock khatm hai — thoda wait karo, refill hote hi khulega.", reply_markup=back_kb())
+        except Exception:
+            pass
         return
     kind = context.user_data.get("buy_kind", "new")
-    await send_stars_invoice(q, context, q.from_user.id, kind, product)
-
-
-async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    pq = update.pre_checkout_query
-    parts = (pq.invoice_payload or "").split(":")
-    product = None
-    if len(parts) >= 4 and parts[2].isdigit():
-        product = get_product(int(parts[2]))
-    if product is None:
-        product = default_product()
-    ok = (
-        len(parts) >= 3
-        and parts[1].isdigit()
-        and int(parts[1]) == pq.from_user.id
-        and pq.currency == "XTR"
-        and product is not None
-        and pq.total_amount == int(product["price_stars"])
-        and is_in_stock(product)
-    )
-    if ok:
-        await pq.answer(ok=True)
-    else:
-        await pq.answer(ok=False, error_message="Stock ya price badal gaya hai — dobara try karo.")
-
-
-async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    sp = update.message.successful_payment
-    user = register_user(update.effective_user)
-
-    # Duplicate protection: ek Charge ID pe ek hi order
-    existing = db_one("SELECT id FROM orders WHERE charge_id=?", (sp.telegram_payment_charge_id,))
-    if existing:
-        log.info("Duplicate payment callback ignored: %s", sp.telegram_payment_charge_id)
-        return
-
-    parts = (sp.invoice_payload or "new").split(":")
-    kind = parts[0] if parts and parts[0] in ("new", "renew") else "new"
-    product = None
-    if len(parts) >= 4 and parts[2].isdigit():
-        product = get_product(int(parts[2]))
-    if product is None:
-        product = default_product()
-
-    oid = db_insert(
-        "INSERT INTO orders(user_id, product, product_id, kind, stars, charge_id, provider_charge_id, status, created_at) "
-        "VALUES(?,?,?,?,?,?,?, 'pending', ?)",
-        (
-            user["user_id"],
-            product["name"] if product else PRODUCT_NAME,
-            int(product["id"]) if product else 0,
-            kind,
-            sp.total_amount,
-            sp.telegram_payment_charge_id,
-            sp.provider_payment_charge_id or "",
-            to_iso(now_utc()),
-        ),
-    )
-    if product and (product.get("stock_mode") or "count") == "count" and int(product["stock"]) > 0:
-        set_product_stock(product["id"], int(product["stock"]) - 1)
-
-    code = order_code(oid)
-    deadline = (now_utc() + timedelta(hours=DELIVERY_HOURS)).astimezone(IST).strftime("%I:%M %p")
-    await update.message.reply_text(
-        "🎉 <b>Payment Successful!</b>\n\n"
-        f"Order ID: <b>{code}</b>\n"
-        f"Paid: ⭐{sp.total_amount} Stars\n"
-        f"⏳ <b>Delivery Time: 2-4 Hours</b> (deadline {deadline})\n"
-        "Status: ⏳ Processing…\n\n"
-        "Delivery isi chat me hogi, tab tak please wait karo. 🙏",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("📦 Order Status Dekho", callback_data=f"order:view:{oid}")],
-                [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
-            ]
-        ),
-    )
-    await notify_admins_new_order(context, oid)
+    await show_upi_payment(context, q.from_user.id, kind, product)
 
 
 async def notify_admins_new_order(context: ContextTypes.DEFAULT_TYPE, oid: int):
@@ -1073,12 +1237,12 @@ async def notify_admins_new_order(context: ContextTypes.DEFAULT_TYPE, oid: int):
     u = db_one("SELECT * FROM users WHERE user_id=?", (o["user_id"],)) or {}
     deadline = (from_iso(o["created_at"]) + timedelta(hours=DELIVERY_HOURS)).astimezone(IST).strftime("%I:%M %p")
     text = (
-        "🔔 <b>NAYA ORDER — PAYMENT MIL GAYI!</b>\n\n"
+        "🔔 <b>NAYA ORDER — PAYMENT VERIFY HO GAYA!</b>\n\n"
         f"Order ID: <b>{order_code(o['id'])}</b>" + (" (RENEWAL)" if o.get("kind") == "renew" else "") + "\n"
         f"User: {u.get('first_name', '')} (@{u.get('username', '-')})\n"
         f"User ID: <code>{o['user_id']}</code>\n"
         f"Product: {o['product']}\n"
-        f"Paid: ⭐{o['stars']} Stars ✅\n"
+        f"Paid: ₹{o['amount_inr']} ✅\n"
         f"Time: {fmt_dt(o['created_at'])}\n"
         "Status: ⏳ Pending Delivery\n"
         f"⚠️ Deadline: <b>{deadline}</b> (4 ghante)"
@@ -1178,7 +1342,7 @@ async def cb_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "report:new":
-        orders = db_all("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 10", (uid,))
+        orders = db_all("SELECT * FROM orders WHERE user_id=? AND status IN ('pending','delivered') ORDER BY id DESC LIMIT 10", (uid,))
         if not orders:
             text = (
                 "🚨 <b>Report</b>\n\n"
@@ -1189,7 +1353,7 @@ async def cb_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rows = []
             first_prod = default_product()
             if first_prod:
-                rows.append([InlineKeyboardButton(f"🛍️ {first_prod['name']} — ⭐{first_prod['price_stars']}", callback_data=f"nav:product:{first_prod['id']}")])
+                rows.append([InlineKeyboardButton(f"🛍️ {first_prod['name']} — ₹{first_prod['price_inr']}", callback_data=f"nav:product:{first_prod['id']}")])
             _gl = get_group_link()
             if _gl:
                 rows.append([InlineKeyboardButton("👥 Public Group", url=_gl)])
@@ -1200,7 +1364,7 @@ async def cb_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(q.message.chat_id, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
             return
         rows = [
-            [InlineKeyboardButton(f"{order_code(o['id'])} — {o['status'].title()}", callback_data=f"report:order:{o['id']}")]
+            [InlineKeyboardButton(f"{order_code(o['id'])} — {status_label(o['status'])}", callback_data=f"report:order:{o['id']}")]
             for o in orders
         ]
         rows.append([InlineKeyboardButton("🏠 Home", callback_data="nav:home")])
@@ -1296,7 +1460,7 @@ async def finalize_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"User: {u.get('first_name', '')} (@{u.get('username', '-')}) — <code>{uid}</code>\n"
         f"Category: {REPORT_CATEGORIES.get(cat, cat)}\n"
         f"Problem: {desc}\n\n"
-        f"Paid: ⭐{o.get('stars', '-')} Stars • Order Time: {fmt_dt(o.get('created_at'))}\n"
+        f"Paid: ₹{o.get('amount_inr', '-')} • Order Time: {fmt_dt(o.get('created_at'))}\n"
         f"Delivery: {fmt_dt(o.get('delivered_at')) if o.get('delivered_at') else 'Abhi pending'}\n"
         f"{warranty_line}\n"
         f"Customer: total {total_orders} order(s)"
@@ -1386,7 +1550,7 @@ async def _show_products_list(update: Update, context: ContextTypes.DEFAULT_TYPE
         lines.append("Abhi koi product nahi hai — neeche se pehla add karo.")
     for pr in prods:
         state = "✅ LIVE" if pr["is_active"] else "🙈 Hidden"
-        lines.append(f"• <b>{pr['name']}</b> — ⭐{pr['price_stars']} • Stock {pr['stock']} • {state}")
+        lines.append(f"• <b>{pr['name']}</b> — ₹{pr['price_inr']} • Stock {pr['stock']} • {state}")
         rows.append([InlineKeyboardButton(f"⚙️ Manage: {pr['name'][:26]}", callback_data=f"admin:prod:{pr['id']}")])
     rows.append([InlineKeyboardButton("➕ Naya Product Add Karo", callback_data="admin:prodadd")])
     rows.append(admin_nav_row("admin:panel"))
@@ -1407,7 +1571,7 @@ async def _show_product_detail(update: Update, context: ContextTypes.DEFAULT_TYP
     state = "✅ LIVE — store me dikh raha hai" if pr["is_active"] else "🙈 HIDDEN — store me nahi dikh raha"
     text = (
         f"🛍️ <b>{pr['name']}</b>\n\n"
-        f"⭐ Daam: <b>{pr['price_stars']} Stars</b>\n"
+        f"💰 Daam: <b>₹{pr['price_inr']}</b>\n"
         f"🏷️ Asli Daam (cut wala): {pr['mrp_text'] or '-'}\n"
         f"📦 Stock: <b>{'♾️ Unlimited — humesha Available' if (pr.get('stock_mode') or 'count') == 'unlimited' else pr['stock']}</b>\n"
         f"⏳ Validity: {pr['validity_days']} din • 🛡️ Warranty: {pr['warranty_days']} din\n"
@@ -1423,7 +1587,7 @@ async def _show_product_detail(update: Update, context: ContextTypes.DEFAULT_TYP
     kb = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("✏️ Naam", callback_data=f"admin:prodedit:name:{pid}"),
-             InlineKeyboardButton("⭐ Daam", callback_data=f"admin:prodedit:price_stars:{pid}")],
+             InlineKeyboardButton("💰 Daam", callback_data=f"admin:prodedit:price_inr:{pid}")],
             [InlineKeyboardButton("📝 Details", callback_data=f"admin:prodedit:description:{pid}"),
              InlineKeyboardButton("🏷️ Asli Daam", callback_data=f"admin:prodedit:mrp_text:{pid}")],
             [InlineKeyboardButton("⏳ Validity", callback_data=f"admin:prodedit:validity_days:{pid}"),
@@ -1452,7 +1616,7 @@ async def _finalize_product_wizard(update: Update, context: ContextTypes.DEFAULT
         return
     maxord = db_one("SELECT COALESCE(MAX(sort_order),0) AS m FROM products")
     db_insert(
-        "INSERT INTO products(name, price_stars, mrp_text, description, validity_days, warranty_days, "
+        "INSERT INTO products(name, price_inr, mrp_text, description, validity_days, warranty_days, "
         "stock, photo_file_id, is_active, sort_order, created_at, stock_mode) VALUES(?,?,?,?,?,?,?,?,1,?,?,?)",
         (
             draft["name"], draft["price"], draft.get("mrp", ""), draft.get("desc", ""),
@@ -1462,7 +1626,7 @@ async def _finalize_product_wizard(update: Update, context: ContextTypes.DEFAULT
     )
     text = (
         f"✅ <b>{draft['name']}</b> — store me <b>LIVE</b> ho gaya! 🎉\n\n"
-        f"⭐ Daam: {draft['price']} Stars\n"
+        f"💰 Daam: ₹{draft['price']}\n"
         f"📦 Stock: {draft['stock']}\n"
         f"⏳ Validity {draft['validity']} din • 🛡️ Warranty {draft['warranty']} din\n\n"
         "Home screen pe iska button abhi se dikhega — bot.py chhedne ki koi zaroorat nahi. 😎"
@@ -1513,7 +1677,9 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚙️ <b>Store Settings</b>\n\n"
         f"🏪 Store ka Naam: <b>{get_store_name()}</b>\n"
         f"🔗 Group Link: {get_group_link() or '(set nahi hai)'}\n"
-        f"📝 Welcome Text: {'custom set hai ✅' if wel else 'default chal raha hai'}\n\n"
+        f"📝 Welcome Text: {'custom set hai ✅' if wel else 'default chal raha hai'}\n"
+        f"💳 UPI ID: <b>{get_setting('upi_id') or 'set nahi hai ❌'}</b>\n"
+        f"🖼️ Payment QR: {'set hai ✅' if get_setting('pay_qr_file_id') else 'set nahi hai'}\n\n"
         "Jo badalna hai, dabao — <b>turant LIVE</b> ho jayega, redeploy ki zaroorat nahi:"
     )
     kb = InlineKeyboardMarkup(
@@ -1521,6 +1687,8 @@ async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("✏️ Store ka Naam", callback_data="admin:setfield:store_name"),
              InlineKeyboardButton("📝 Welcome Text", callback_data="admin:setfield:welcome_text")],
             [InlineKeyboardButton("🔗 Group Link Badlo", callback_data="admin:setfield:group_link")],
+            [InlineKeyboardButton("💳 UPI ID Badlo", callback_data="admin:setfield:upi_id"),
+             InlineKeyboardButton("🖼️ Payment QR", callback_data="admin:payqr")],
             admin_nav_row("admin:panel"),
         ]
     )
@@ -1542,16 +1710,27 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_admin_panel(update, context)
 
     elif data == "admin:pending":
+        reviews = db_all("SELECT * FROM orders WHERE status='payment_review' ORDER BY id ASC LIMIT 15")
         orders = db_all("SELECT * FROM orders WHERE status='pending' ORDER BY id ASC LIMIT 15")
-        if not orders:
-            text, rows = "📋 <b>Pending Orders</b>\n\nKoi pending order nahi hai. 🎉", []
-        else:
-            lines, rows = ["📋 <b>Pending Orders</b>\n"], []
+        lines, rows = ["📋 <b>Pending Orders</b>\n"], []
+        if reviews:
+            lines.append("💳 <b>Payment Review Wale (pehle inhe dekho):</b>")
+            for o in reviews:
+                lines.append(f"• <b>{order_code(o['id'])}</b> — {o['product']} — ₹{o['amount_inr']} • UTR: {o.get('pay_utr') or '-'}")
+                rows.append([
+                    InlineKeyboardButton(f"✅ Approve {order_code(o['id'])}", callback_data=f"payok:{o['id']}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"payno:{o['id']}"),
+                ])
+            lines.append("")
+        if orders:
+            lines.append("📦 <b>Delivery Wale:</b>")
             for o in orders:
                 age_h = (now_utc() - from_iso(o["created_at"])).total_seconds() / 3600
-                lines.append(f"• <b>{order_code(o['id'])}</b> — ⭐{o['stars']} • {age_h:.1f} ghante ho gaye")
+                lines.append(f"• <b>{order_code(o['id'])}</b> — ₹{o['amount_inr']} • {age_h:.1f} ghante ho gaye")
                 rows.append([InlineKeyboardButton(f"✅ Deliver {order_code(o['id'])}", callback_data=f"admin:deliver:{o['id']}")])
-            text = "\n".join(lines)
+        if not reviews and not orders:
+            lines.append("Koi pending order nahi hai. 🎉")
+        text = "\n".join(lines)
         rows.append(admin_nav_row("admin:panel"))
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
 
@@ -1574,18 +1753,12 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         users_c = db_one("SELECT COUNT(*) AS c FROM users")["c"]
         orders_c = db_one("SELECT COUNT(*) AS c FROM orders")["c"]
         delivered = db_one("SELECT COUNT(*) AS c FROM orders WHERE status='delivered'")["c"]
-        stars_sum = db_one("SELECT COALESCE(SUM(stars),0) AS s FROM orders")["s"]
-        bal_line = ""
-        try:
-            bal = await context.bot.get_my_star_balance()
-            bal_line = f"\n⭐ Bot Stars Balance: <b>{getattr(bal, 'amount', bal)}</b>"
-        except Exception:
-            pass
+        earned = db_one("SELECT COALESCE(SUM(amount_inr),0) AS s FROM orders WHERE status IN ('pending','delivered')")["s"]
         await q.edit_message_text(
             "📊 <b>Store Stats</b>\n\n"
             f"👥 Total Users: <b>{users_c}</b>\n"
             f"🧾 Total Orders: <b>{orders_c}</b> (Delivered: {delivered})\n"
-            f"⭐ Total Stars Earned: <b>{stars_sum}</b>{bal_line}\n"
+            f"💰 Total Kamai: <b>₹{earned}</b>\n"
             f"📦 Kul Stock Bacha: <b>{total_stock()}</b>",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([admin_nav_row("admin:panel")]),
@@ -1662,9 +1835,21 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "store_name": "✏️ Store ka <b>naya naam</b> bhejo (jaise: Apna AI Store):",
             "welcome_text": "📝 Home screen ka <b>naya welcome text</b> bhejo (jo 'Hello {name}' ke neeche dikhega).\nDefault pe wapas karna ho to sirf <b>-</b> bhejo:",
             "group_link": "🔗 <b>Naya Public Group link</b> bhejo (https://t.me/... se shuru hona chahiye).\nPurane (env wale) link pe wapas karna ho to sirf <b>-</b> bhejo:",
+            "upi_id": "💳 Apna <b>UPI ID</b> bhejo — customer isi pe payment karega.\n(jaise: <code>9876543210@paytm</code> ya <code>naam@okhdfcbank</code>)",
         }
         context.user_data["awaiting"] = {"kind": "set_field", "field": field}
         await context.bot.send_message(q.from_user.id, prompts[field], parse_mode="HTML", reply_markup=cancel_kb())
+
+    elif data == "admin:payqr":
+        context.user_data["awaiting"] = {"kind": "set_payqr"}
+        await context.bot.send_message(
+            q.from_user.id,
+            "🖼️ <b>Payment QR Photo</b>\n\nApne UPI app (GPay/PhonePe/Paytm) wala <b>QR code photo</b> bhejo — "
+            "wahi QR har customer ko payment screen pe dikhega.\n\n"
+            "💡 Tip: QR aisa rakho jisme amount khud bharna pade — bot amount alag se batata hai. "
+            "Agar QR kisi ek amount pe lock hai to purane hisaab se dikkat hogi.",
+            parse_mode="HTML", reply_markup=cancel_kb(),
+        )
 
     elif data == "admin:osearch":
         context.user_data["awaiting"] = {"kind": "order_search"}
@@ -1706,7 +1891,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         prompts = {
             "name": f"✏️ <b>{prod['name']}</b> ka naya <b>naam</b> bhejo:",
-            "price_stars": f"⭐ <b>{prod['name']}</b> ka naya <b>daam (Stars)</b> — sirf number bhejo:",
+            "price_inr": f"💰 <b>{prod['name']}</b> ka naya <b>daam (₹)</b> — sirf number bhejo:",
             "mrp_text": f"🏷️ <b>{prod['name']}</b> ka <b>asli (cut wala) daam</b> bhejo — jaise ₹599. Hatana ho to sirf - bhejo:",
             "description": f"📝 <b>{prod['name']}</b> ki nayi <b>details/description</b> likh ke bhejo (kai line bhi chalega). Khali rakhna ho to - bhejo:",
             "validity_days": f"⏳ <b>{prod['name']}</b> ki <b>Validity kitne din</b>? Sirf number bhejo:",
@@ -1910,9 +2095,49 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("📸 Photo bhejo, ya upar wala Skip button dabao.")
         return
 
+    # ---- Payment proof: screenshot ----
+    if kind == "pay_shot":
+        if msg.photo:
+            context.user_data["pay_shot"] = msg.photo[-1].file_id
+            product = get_product(context.user_data.get("buy_pid")) or default_product()
+            context.user_data["awaiting"] = {"kind": "pay_utr"}
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭️ Skip — UTR Nahi Hai", callback_data="pay:utrskip")]])
+            amt = int(product["price_inr"]) if product else "?"
+            await msg.reply_text(
+                f"✅ Screenshot mil gaya! (₹{amt} wala payment)\n\n"
+                "🧾 Ab <b>UTR / Transaction ID</b> bhejo — 12 digit ka number hota hai, payment ke receipt/screenshot me dikhta hai. Isse verify turant hoga.\n"
+                "Nahi mil raha to <b>Skip</b> dabao:",
+                parse_mode="HTML", reply_markup=kb,
+            )
+        else:
+            await msg.reply_text("📸 Photo (screenshot) bhejo — sirf text se payment verify nahi hoga.")
+        return
+
+    # ---- Payment proof: UTR ----
+    if kind == "pay_utr":
+        if not msg.text:
+            await msg.reply_text("✍️ UTR number likh ke bhejo — ya upar Skip dabao.")
+            return
+        await finalize_pay_review(context, uid, msg.text.strip()[:40])
+        return
+
     # ---- Neeche wale sirf ADMIN ke liye ----
     if not is_admin(uid):
         context.user_data.pop("awaiting", None)
+        return
+
+    # ---- Settings: Payment QR photo ----
+    if kind == "set_payqr":
+        if msg.photo:
+            set_setting("pay_qr_file_id", msg.photo[-1].file_id)
+            context.user_data.pop("awaiting", None)
+            await msg.reply_photo(
+                msg.photo[-1].file_id,
+                caption="✅ <b>Ye QR set ho gaya!</b>\nAb har customer ko payment screen pe yahi QR dikhega.",
+                parse_mode="HTML",
+            )
+        else:
+            await msg.reply_text("🖼️ QR wali photo bhejo.")
         return
 
     # ---- Naya Product Wizard (step-by-step, sab bot se) ----
@@ -1922,7 +2147,7 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data.setdefault("prod_draft", {})["name"] = msg.text.strip()[:60]
         context.user_data["awaiting"] = {"kind": "pw_price"}
-        await msg.reply_text("🆕 <b>Step 2/8 — Daam</b>\n\nKitne <b>Stars</b> me bechna hai? Sirf number bhejo (jaise: 150)", parse_mode="HTML", reply_markup=cancel_kb())
+        await msg.reply_text("🆕 <b>Step 2/8 — Daam</b>\n\nKitne <b>₹ rupaye</b> me bechna hai? Sirf number bhejo (jaise: 199)", parse_mode="HTML", reply_markup=cancel_kb())
         return
 
     if kind == "pw_price":
@@ -2027,6 +2252,14 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_setting("welcome_text", "" if t == "-" else t[:600])
             context.user_data.pop("awaiting", None)
             await msg.reply_text("✅ Welcome text " + ("default pe wapas ho gaya." if t == "-" else "badal gaya — Home pe turant dikhega."), parse_mode="HTML")
+        elif field == "upi_id":
+            if "@" in t and " " not in t and 6 <= len(t) <= 80:
+                set_setting("upi_id", t)
+                context.user_data.pop("awaiting", None)
+                await msg.reply_text(f"✅ UPI ID set ho gaya: <code>{t}</code> — ab customer isi pe payment karega.", parse_mode="HTML")
+            else:
+                await msg.reply_text("💳 Sahi UPI ID bhejo (jaise 9876543210@paytm) — @ hona chahiye, space nahi.")
+                return
         elif field == "group_link":
             if t == "-":
                 set_setting("group_link", "")
@@ -2066,7 +2299,7 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🧾 <b>Order {order_code(o['id'])}</b>\n\n"
             f"Product: {o['product']}\n"
             f"User: {u.get('first_name', '?')} (@{u.get('username', '-')}) • <code>{o['user_id']}</code>\n"
-            f"Paid: ⭐{o['stars']} Stars\n"
+            f"Paid: ₹{o['amount_inr']}\n"
             f"Status: <b>{o['status'].title()}</b>\n"
             f"Order Time: {fmt_dt(o['created_at'])}"
             + (f"\nDelivered: {fmt_dt(o['delivered_at'])}" if o.get("delivered_at") else ""),
@@ -2079,12 +2312,12 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         field = state.get("field")
         pid = state.get("pid")
         prod = get_product(pid)
-        if not prod or field not in ("name", "price_stars", "mrp_text", "description", "validity_days", "warranty_days"):
+        if not prod or field not in ("name", "price_inr", "mrp_text", "description", "validity_days", "warranty_days"):
             context.user_data.pop("awaiting", None)
             return
-        if field in ("price_stars", "validity_days", "warranty_days"):
+        if field in ("price_inr", "validity_days", "warranty_days"):
             n = _to_int(msg.text) if msg.text else None
-            lo, hi = (1, 100000) if field == "price_stars" else (0, 3650)
+            lo, hi = (1, 100000) if field == "price_inr" else (0, 3650)
             if n is None or n < lo or n > hi:
                 await msg.reply_text(f"🔢 Sirf sahi number bhejo ({lo} se {hi} ke beech).")
                 return
@@ -2102,7 +2335,7 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 val = "" if t == "-" else t[:1500]
         db_exec(f"UPDATE products SET {field}=? WHERE id=?", (val, pid))
         context.user_data.pop("awaiting", None)
-        labels = {"name": "Naam", "price_stars": "Daam", "mrp_text": "Asli daam", "description": "Details", "validity_days": "Validity", "warranty_days": "Warranty"}
+        labels = {"name": "Naam", "price_inr": "Daam", "mrp_text": "Asli daam", "description": "Details", "validity_days": "Validity", "warranty_days": "Warranty"}
         await msg.reply_text(f"✅ <b>{prod['name']}</b> ka <b>{labels[field]}</b> badal gaya — store me turant LIVE hai. 🎉", parse_mode="HTML")
         return
 
@@ -2259,11 +2492,15 @@ async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
     log.exception("Handler error: %s", context.error)
     try:
         if update is not None and getattr(update, "callback_query", None):
-            await update.callback_query.answer(
-                "⚠️ Kuch gadbad ho gayi — ek baar dobara try karo. Dikkat rahe to /start dabao.",
-                show_alert=True,
-            )
-        elif update is not None and getattr(update, "effective_chat", None):
+            try:
+                await update.callback_query.answer(
+                    "⚠️ Kuch gadbad ho gayi — ek baar dobara try karo. Dikkat rahe to /start dabao.",
+                    show_alert=True,
+                )
+                return
+            except Exception:
+                pass  # query purana/answer ho chuka — neeche chat message bhej do
+        if update is not None and getattr(update, "effective_chat", None):
             await context.bot.send_message(
                 update.effective_chat.id,
                 "⚠️ Kuch gadbad ho gayi — dobara try karo, ya /start dabake shuru se aao.",
@@ -2324,7 +2561,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(
                     s["user_id"],
                     f"⏳ Tumhari subscription <b>{days_left(s['validity_end'])} din</b> me expire ho jayegi ({fmt_dt(s['validity_end'])}).\n"
-                    f"Renew karna ho to bot me My Subscription se Renew dabao — ⭐{(get_product(s.get('product_id')) or get_product_by_name(s.get('product')) or {}).get('price_stars', PRICE_STARS)} Stars.",
+                    f"Renew karna ho to bot me My Subscription se Renew dabao — ₹{(get_product(s.get('product_id')) or get_product_by_name(s.get('product')) or {}).get('price_inr', PRICE_INR)}.",
                     parse_mode="HTML",
                 )
             except Exception:
@@ -2334,12 +2571,12 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
 async def daily_report_job(context: ContextTypes.DEFAULT_TYPE):
     today = now_utc().astimezone(IST).strftime("%Y-%m-%d")
     todays = [o for o in db_all("SELECT * FROM orders") if (from_iso(o["created_at"]) or now_utc()).astimezone(IST).strftime("%Y-%m-%d") == today]
-    stars = sum(o["stars"] for o in todays)
+    kamai = sum((o["amount_inr"] or 0) for o in todays if o["status"] in ("pending", "delivered"))
     pending = db_one("SELECT COUNT(*) AS c FROM orders WHERE status='pending'")["c"]
     text = (
         f"🌙 <b>Daily Report — {today}</b>\n\n"
         f"🧾 Aaj ke Orders: <b>{len(todays)}</b>\n"
-        f"⭐ Aaj ke Stars: <b>{stars}</b>\n"
+        f"💰 Aaj ki Kamai: <b>₹{kamai}</b>\n"
         f"⏳ Abhi Pending: <b>{pending}</b>\n"
         f"📦 Kul Stock Bacha: <b>{total_stock()}</b>"
     )
@@ -2457,8 +2694,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_admin, pattern="^(admin:|prodwiz:|input:)"))
     app.add_handler(CallbackQueryHandler(cb_nav, pattern="^(nav:|noop$)"))
 
-    app.add_handler(PreCheckoutQueryHandler(pre_checkout))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+    app.add_handler(CallbackQueryHandler(cb_pay, pattern=r"^(pay:|payok:|payno:)"))
 
     # Pending-input (private chat) — commands ke alawa
     app.add_handler(
@@ -2490,7 +2726,7 @@ async def _cmd_list_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     lines = ["📦 <b>My Orders</b>\n"]
     for o in orders:
-        lines.append(f"• <b>{order_code(o['id'])}</b> — ⭐{o['stars']} • {o['status'].title()} • {fmt_dt(o['created_at'])}")
+        lines.append(f"• <b>{order_code(o['id'])}</b> — ₹{o['amount_inr']} • {status_label(o['status'])} • {fmt_dt(o['created_at'])}")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
