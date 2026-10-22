@@ -76,6 +76,11 @@ ADMIN_IDS = {
     if x.strip().lstrip("-").isdigit()
 }
 GROUP_ID = _env_int("GROUP_ID", 0)
+if GROUP_ID >= 10**12:
+    # Supergroup ID hamesha -100... se shuru hoti hai. Env me minus gir
+    # jaaye to bot khud theek kar lega — users ka Verify kabhi na atke.
+    print(f"⚠️ GROUP_ID {GROUP_ID} positive hai — supergroup ID negative hoti hai, minus jod diya: {-GROUP_ID}")
+    GROUP_ID = -GROUP_ID
 GROUP_LINK = os.environ.get("GROUP_LINK", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 PRICE_STARS = _env_int("PRICE_STARS", 150)
@@ -663,7 +668,8 @@ async def send_product(chat_send, user_id: int, pid=None):
     prod = get_product(pid) if pid else default_product()
     if not prod:
         await chat_send.send_message(
-            "🛍️ Abhi koi product available nahi hai — thoda wait karo!",
+            chat_id=user_id,
+            text="🛍️ Abhi koi product available nahi hai — thoda wait karo!",
             reply_markup=back_kb(),
         )
         return
@@ -672,17 +678,17 @@ async def send_product(chat_send, user_id: int, pid=None):
     photo_id = prod.get("photo_file_id")
     try:
         if photo_id:
-            await chat_send.send_photo(photo=photo_id, caption=text, parse_mode="HTML", reply_markup=kb)
+            await chat_send.send_photo(chat_id=user_id, photo=photo_id, caption=text, parse_mode="HTML", reply_markup=kb)
             return
         # Bundled poster sirf sabse pehle (seed) product ke liye fallback hai
         first = db_one("SELECT MIN(id) AS m FROM products")
         if first and int(prod["id"]) == int(first["m"] or 0) and os.path.exists(PRODUCT_FILE):
             with open(PRODUCT_FILE, "rb") as f:
-                await chat_send.send_photo(photo=f, caption=text, parse_mode="HTML", reply_markup=kb)
+                await chat_send.send_photo(chat_id=user_id, photo=f, caption=text, parse_mode="HTML", reply_markup=kb)
             return
     except Exception as e:
         log.warning("product photo failed: %s", e)
-    await chat_send.send_message(text=text, parse_mode="HTML", reply_markup=kb)
+    await chat_send.send_message(chat_id=user_id, text=text, parse_mode="HTML", reply_markup=kb)
 
 
 async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -780,11 +786,13 @@ async def cb_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pid = int(data.split(":")[2])
             except (IndexError, ValueError):
                 pid = None
+        # Pehle naya page bhejo, phir purana hatao — ulta karne pe koi
+        # gadbad ho to user ke saamne sab gayab ho jata tha.
+        await send_product(context.bot, user["user_id"], pid)
         try:
             await q.delete_message()
         except Exception:
             pass
-        await send_product(context.bot, user["user_id"], pid)
     elif data == "nav:myorders":
         await show_my_orders(update, context, user["user_id"])
     elif data == "nav:mysub":
@@ -1172,7 +1180,24 @@ async def cb_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "report:new":
         orders = db_all("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 10", (uid,))
         if not orders:
-            await q.answer("Pehle koi order karo — bina order ke report nahi banti. Aam sawal ke liye Public Group hai.", show_alert=True)
+            text = (
+                "🚨 <b>Report</b>\n\n"
+                "Report kisi <b>order</b> ki dikkat ke liye hoti hai — tumhara abhi koi order nahi hai, isliye report ban nahi sakti.\n\n"
+                "🛍️ Kuch kharidna hai → neeche se product chuno\n"
+                "💬 Aam sawal ya dikkat hai → <b>Public Group</b> me puchh lo, wahan sabse tez jawab milega."
+            )
+            rows = []
+            first_prod = default_product()
+            if first_prod:
+                rows.append([InlineKeyboardButton(f"🛍️ {first_prod['name']} — ⭐{first_prod['price_stars']}", callback_data=f"nav:product:{first_prod['id']}")])
+            _gl = get_group_link()
+            if _gl:
+                rows.append([InlineKeyboardButton("👥 Public Group", url=_gl)])
+            rows.append([InlineKeyboardButton("🏠 Home", callback_data="nav:home")])
+            try:
+                await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+            except BadRequest:
+                await context.bot.send_message(q.message.chat_id, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
             return
         rows = [
             [InlineKeyboardButton(f"{order_code(o['id'])} — {o['status'].title()}", callback_data=f"report:order:{o['id']}")]
@@ -2227,6 +2252,27 @@ async def group_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --------------------------------------------------------------------------- #
+# Global error handler — koi bhi handler fisle to user ko khabar milegi,
+# screen chup-chaap gayab nahi hogi.
+# --------------------------------------------------------------------------- #
+async def error_handler(update, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Handler error: %s", context.error)
+    try:
+        if update is not None and getattr(update, "callback_query", None):
+            await update.callback_query.answer(
+                "⚠️ Kuch gadbad ho gayi — ek baar dobara try karo. Dikkat rahe to /start dabao.",
+                show_alert=True,
+            )
+        elif update is not None and getattr(update, "effective_chat", None):
+            await context.bot.send_message(
+                update.effective_chat.id,
+                "⚠️ Kuch gadbad ho gayi — dobara try karo, ya /start dabake shuru se aao.",
+            )
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
 # Reminder jobs
 # --------------------------------------------------------------------------- #
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2423,6 +2469,7 @@ def main():
     )
     # Public group guard
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, group_guard))
+    app.add_error_handler(error_handler)
 
     if app.job_queue:
         app.job_queue.run_repeating(reminder_job, interval=1800, first=120)
