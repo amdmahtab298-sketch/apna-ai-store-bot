@@ -62,7 +62,7 @@ def _env_int(name, default):
     """Env var ko surakshit int me badlo — galat/text value pe crash ki
     jagah default use hoga (deploy pe chhoti typing galti bot na mare)."""
     try:
-        raw = str(os.environ.get(name, "")).strip()
+        raw = str(os.environ.get(name, "")).strip().strip('"').strip("'").strip()
         return int(raw) if raw else int(default)
     except (TypeError, ValueError):
         print(f"⚠️ {name} ki value number nahi hai — default {default} use hoga")
@@ -184,6 +184,27 @@ def _q(sql: str) -> str:
     return sql.replace("?", "%s") if USE_PG else sql
 
 
+def _is_conn_error(e) -> bool:
+    """Sirf asli connection-todne wale error pe True — aam SQL error
+    (jaise duplicate column) pe healthy connection NAHI todna chahiye."""
+    if not USE_PG:
+        return False
+    classes = []
+    try:
+        import psycopg
+
+        for n in ("OperationalError", "InterfaceError"):
+            c = getattr(psycopg, n, None)
+            if isinstance(c, type):
+                classes.append(c)
+    except Exception:
+        pass
+    if classes and isinstance(e, tuple(classes)):
+        return True
+    s = str(e).lower()
+    return any(k in s for k in ("closed", "connection", "server closed", "broken pipe", "eof detected", "terminating"))
+
+
 def _with_conn(work):
     """work(cur) ko ek connection pe chalao. PG connection REUSE hota hai
     (har query pe naya connection nahi — bot ki speed yahi se aati hai);
@@ -196,12 +217,12 @@ def _with_conn(work):
                 out = work(cur)
                 conn.commit()
                 return out
-            except Exception:
+            except Exception as e:
                 try:
                     conn.rollback()
                 except Exception:
                     pass
-                if USE_PG and attempt == 0:
+                if USE_PG and attempt == 0 and _is_conn_error(e):
                     _drop_pg_conn()
                     continue
                 raise
@@ -290,6 +311,7 @@ def init_db():
             "INSERT INTO settings(key, value) VALUES('stock', ?)",
             (str(INITIAL_STOCK),),
         )
+    _ensure_column("products", "stock_mode", "TEXT DEFAULT 'count'")
     _ensure_column("orders", "product_id", "INTEGER DEFAULT 0")
     _ensure_column("subscriptions", "product_id", "INTEGER DEFAULT 0")
     if db_one("SELECT id FROM products LIMIT 1") is None:
@@ -377,6 +399,31 @@ def get_setting(key, default=None):
     return row["value"] if row else default
 
 
+def set_setting(key, value):
+    db_exec(
+        "INSERT INTO settings(key, value) VALUES(?, ?) "
+        + ("ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value" if USE_PG else "ON CONFLICT(key) DO UPDATE SET value=excluded.value"),
+        (key, str(value)),
+    )
+
+
+def get_store_name() -> str:
+    return get_setting("store_name") or STORE_NAME
+
+
+def get_group_link() -> str:
+    return get_setting("group_link") or GROUP_LINK
+
+
+def get_approved_ids():
+    raw = get_setting("approved_ids", "") or ""
+    return {int(x) for x in raw.replace(";", ",").split(",") if x.strip().lstrip("-").isdigit()}
+
+
+def set_approved_ids(ids):
+    set_setting("approved_ids", ",".join(str(i) for i in sorted(ids)))
+
+
 # --------------------------------------------------------------------------- #
 # Products — sab kuch DATABASE me hai. Admin bot se hi add/edit karta hai,
 # naya product turant store me LIVE ho jata hai (code change ki zaroorat nahi).
@@ -405,6 +452,15 @@ def get_product_by_name(name):
 def default_product():
     ps = get_products(active_only=True)
     return ps[0] if ps else None
+
+
+def is_in_stock(prod) -> bool:
+    """Unlimited mode = humesha available; count mode = stock > 0."""
+    if not prod:
+        return False
+    if (prod.get("stock_mode") or "count") == "unlimited":
+        return True
+    return int(prod["stock"]) > 0
 
 
 def set_product_stock(pid, n):
@@ -452,6 +508,8 @@ def register_user(user) -> dict:
 
 _member_cache: dict = {}  # user_id -> (is_member, monotonic_ts)
 _MEMBER_TTL = 300  # 5 minute — har tap pe Telegram API nahi (speed)
+_MEMBER_TTL_NEG = 20  # "member nahi" wala jawab sirf 20s cache — join ke turant baad atke nahi
+_last_member_error = ""  # aakhiri membership-check error (Health screen ke liye)
 
 
 async def is_group_member(
@@ -463,20 +521,28 @@ async def is_group_member(
         return True
     if is_admin(user_id):
         return True
+    if user_id in get_approved_ids():
+        return True  # admin ne khud approve kiya hai (Verify atke to ilaaj)
     import time as _time
 
+    global _last_member_error
     if not force:
         hit = _member_cache.get(user_id)
-        if hit and (_time.monotonic() - hit[1]) < _MEMBER_TTL:
-            return hit[0]
+        if hit:
+            ttl = _MEMBER_TTL if hit[0] else _MEMBER_TTL_NEG
+            if (_time.monotonic() - hit[1]) < ttl:
+                return hit[0]
     try:
         member = await context.bot.get_chat_member(GROUP_ID, user_id)
     except BadRequest as e:
+        _last_member_error = f"BadRequest: {e}"
         log.warning("get_chat_member failed (%s) — bot group me admin hai?", e)
         return False
     except Exception as e:  # network etc.
+        _last_member_error = f"{type(e).__name__}: {e}"
         log.warning("member check error: %s", e)
         return False
+    _last_member_error = ""
     if member.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
         result = True
     elif member.status == ChatMemberStatus.RESTRICTED and getattr(member, "is_member", False):
@@ -506,34 +572,41 @@ def home_kb(user_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("📋 My Reports", callback_data="report:my"),
         ],
     ]
-    if GROUP_LINK:
-        rows.append([InlineKeyboardButton("👥 Public Group", url=GROUP_LINK)])
+    _gl = get_group_link()
+    if _gl:
+        rows.append([InlineKeyboardButton("👥 Public Group", url=_gl)])
     if is_admin(user_id):
         rows.append([InlineKeyboardButton("🔐 Admin Panel", callback_data="admin:panel")])
     return InlineKeyboardMarkup(rows)
 
 
 def home_text(first_name: str) -> str:
-    return (
-        f"⚡ <b>Welcome to {STORE_NAME}!</b>\n\n"
-        f"Hello {first_name}!\n\n"
+    custom = get_setting("welcome_text")
+    body = custom if custom else (
         "🛍️ Browse our premium AI services and choose your plan.\n"
         "⭐ Pay securely via Telegram Stars\n"
         "🍀 Trust issues? Visit our Public Group 👥\n\n"
         "Select a product below to get started:"
     )
+    return (
+        f"⚡ <b>Welcome to {get_store_name()}!</b>\n\n"
+        f"Hello {first_name}!\n\n"
+        + body
+    )
 
 
 def join_kb() -> InlineKeyboardMarkup:
     rows = []
-    if GROUP_LINK:
-        rows.append([InlineKeyboardButton("👥 Public Group Join Karo", url=GROUP_LINK)])
+    _gl = get_group_link()
+    if _gl:
+        rows.append([InlineKeyboardButton("👥 Public Group Join Karo", url=_gl)])
     rows.append([InlineKeyboardButton("✅ Join Kar Liya — Verify Karo", callback_data="join:verify")])
     return InlineKeyboardMarkup(rows)
 
 
-JOIN_TEXT = (
-    f"🔒 <b>{STORE_NAME} abhi locked hai!</b>\n\n"
+def join_text() -> str:
+    return (
+    f"🔒 <b>{get_store_name()} abhi locked hai!</b>\n\n"
     "Bot use karne ke liye pehle hamara <b>Public Group</b> join karna zaroori hai — "
     "wahi sab buyers baat karte hain, reviews aur delivery proofs wahi milte hain.\n\n"
     "1️⃣ Neeche wala button dabake group join karo\n"
@@ -545,9 +618,23 @@ def back_kb(target="nav:home", label="🏠 Home"):
     return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=target)]])
 
 
+def admin_nav_row(back_cb=None):
+    """Har admin screen ke neeche: Back + Home + Exit Admin Panel."""
+    row = []
+    if back_cb:
+        row.append(InlineKeyboardButton("⬅️ Back", callback_data=back_cb))
+    row.append(InlineKeyboardButton("🏠 Home", callback_data="nav:home"))
+    row.append(InlineKeyboardButton("🚪 Exit", callback_data="nav:home"))
+    return row
+
+
+def cancel_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel Karo", callback_data="input:cancel")]])
+
+
 def product_kb(prod) -> InlineKeyboardMarkup:
     rows = []
-    if int(prod["stock"]) > 0:
+    if is_in_stock(prod):
         rows.append([InlineKeyboardButton(f"⭐ Buy Now — {prod['price_stars']} Stars", callback_data=f"buy:start:{prod['id']}")])
     else:
         rows.append([InlineKeyboardButton("❌ Out of Stock", callback_data="noop")])
@@ -556,8 +643,7 @@ def product_kb(prod) -> InlineKeyboardMarkup:
 
 
 def product_text(prod) -> str:
-    stock = int(prod["stock"])
-    stock_line = "📦 <b>Stock: Available ✅</b>" if stock > 0 else "📦 <b>Stock: Khatm ❌</b> — thoda wait karo, refill hote hi khulega."
+    stock_line = "📦 <b>Stock: Available ✅</b>" if is_in_stock(prod) else "📦 <b>Stock: Khatm ❌</b> — thoda wait karo, refill hote hi khulega."
     if prod.get("mrp_text"):
         price_line = f"💰 Price: <s>{prod['mrp_text']}</s> <b>⭐{prod['price_stars']} Stars</b>"
     else:
@@ -615,11 +701,11 @@ async def show_home(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         try:
-            await update.callback_query.edit_message_text(JOIN_TEXT, parse_mode="HTML", reply_markup=join_kb())
+            await update.callback_query.edit_message_text(join_text(), parse_mode="HTML", reply_markup=join_kb())
             return
         except BadRequest:
             pass
-    await context.bot.send_message(update.effective_chat.id, JOIN_TEXT, parse_mode="HTML", reply_markup=join_kb())
+    await context.bot.send_message(update.effective_chat.id, join_text(), parse_mode="HTML", reply_markup=join_kb())
 
 
 # --------------------------------------------------------------------------- #
@@ -645,7 +731,7 @@ async def cmd_shop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_paysupport(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    link = GROUP_LINK or "Public Group"
+    link = get_group_link() or "Public Group"
     await update.message.reply_text(
         f"💳 Payment me dikkat? Hamare Public Group me aake admin se baat karo: {link}\n"
         "Order ki dikkat ho to bot me 🚨 Report option use karo (Order ID ke saath)."
@@ -876,7 +962,7 @@ async def cb_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(q.message.chat_id, terms_text(product), parse_mode="HTML", reply_markup=kb)
         return
 
-    if int(product["stock"]) <= 0:
+    if not is_in_stock(product):
         await q.answer("❌ Is product ka stock khatm hai! Thoda wait karo.", show_alert=True)
         return
     await send_stars_invoice(q, context, user["user_id"], kind, product)
@@ -887,7 +973,7 @@ async def cb_terms(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer("✅ Terms accept ho gaye!")
     db_exec("UPDATE users SET terms_accepted=1 WHERE user_id=?", (q.from_user.id,))
     product = get_product(context.user_data.get("buy_pid")) or default_product()
-    if not product or int(product["stock"]) <= 0:
+    if not product or not is_in_stock(product):
         await q.answer("❌ Is product ka stock khatm hai! Thoda wait karo.", show_alert=True)
         return
     kind = context.user_data.get("buy_kind", "new")
@@ -909,7 +995,7 @@ async def pre_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
         and pq.currency == "XTR"
         and product is not None
         and pq.total_amount == int(product["price_stars"])
-        and int(product["stock"]) > 0
+        and is_in_stock(product)
     )
     if ok:
         await pq.answer(ok=True)
@@ -949,7 +1035,7 @@ async def successful_payment(update: Update, context: ContextTypes.DEFAULT_TYPE)
             to_iso(now_utc()),
         ),
     )
-    if product and int(product["stock"]) > 0:
+    if product and (product.get("stock_mode") or "count") == "count" and int(product["stock"]) > 0:
         set_product_stock(product["id"], int(product["stock"]) - 1)
 
     code = order_code(oid)
@@ -1234,6 +1320,14 @@ def admin_panel_kb():
                 InlineKeyboardButton("🚨 Open Reports", callback_data="admin:reports"),
                 InlineKeyboardButton("📣 Broadcast", callback_data="admin:broadcast"),
             ],
+            [
+                InlineKeyboardButton("👥 Users", callback_data="admin:users"),
+                InlineKeyboardButton("🩺 Health Check", callback_data="admin:health"),
+            ],
+            [
+                InlineKeyboardButton("🔍 Order Search", callback_data="admin:osearch"),
+                InlineKeyboardButton("⚙️ Settings", callback_data="admin:settings"),
+            ],
             [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
         ]
     )
@@ -1243,7 +1337,7 @@ async def send_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending = db_one("SELECT COUNT(*) AS c FROM orders WHERE status='pending'")["c"]
     open_reps = db_one("SELECT COUNT(*) AS c FROM reports WHERE status='open'")["c"]
     text = (
-        "🔐 <b>Admin Panel — Apna AI Store</b>\n\n"
+        f"🔐 <b>Admin Panel — {get_store_name()}</b>\n\n"
         f"⏳ Pending Orders: <b>{pending}</b>\n"
         f"🚨 Open Reports: <b>{open_reps}</b>\n"
         f"🛍️ Products: <b>{len(get_products())}</b>\n"
@@ -1270,7 +1364,7 @@ async def _show_products_list(update: Update, context: ContextTypes.DEFAULT_TYPE
         lines.append(f"• <b>{pr['name']}</b> — ⭐{pr['price_stars']} • Stock {pr['stock']} • {state}")
         rows.append([InlineKeyboardButton(f"⚙️ Manage: {pr['name'][:26]}", callback_data=f"admin:prod:{pr['id']}")])
     rows.append([InlineKeyboardButton("➕ Naya Product Add Karo", callback_data="admin:prodadd")])
-    rows.append([InlineKeyboardButton("🔐 Admin Panel", callback_data="admin:panel")])
+    rows.append(admin_nav_row("admin:panel"))
     text = "\n".join(lines)
     kb = InlineKeyboardMarkup(rows)
     try:
@@ -1290,7 +1384,7 @@ async def _show_product_detail(update: Update, context: ContextTypes.DEFAULT_TYP
         f"🛍️ <b>{pr['name']}</b>\n\n"
         f"⭐ Daam: <b>{pr['price_stars']} Stars</b>\n"
         f"🏷️ Asli Daam (cut wala): {pr['mrp_text'] or '-'}\n"
-        f"📦 Stock: <b>{pr['stock']}</b>\n"
+        f"📦 Stock: <b>{'♾️ Unlimited — humesha Available' if (pr.get('stock_mode') or 'count') == 'unlimited' else pr['stock']}</b>\n"
         f"⏳ Validity: {pr['validity_days']} din • 🛡️ Warranty: {pr['warranty_days']} din\n"
         f"🖼️ Photo: {'lagi hai ✅' if pr['photo_file_id'] else 'nahi lagi'}\n"
         f"📌 Haalat: {state}\n\n"
@@ -1312,9 +1406,10 @@ async def _show_product_detail(update: Update, context: ContextTypes.DEFAULT_TYP
             [InlineKeyboardButton("📦 Stock Set", callback_data=f"admin:prodstock:set:{pid}"),
              InlineKeyboardButton("➕ Stock Add", callback_data=f"admin:prodstock:add:{pid}")],
             [InlineKeyboardButton("🖼️ Photo Badlo", callback_data=f"admin:prodphoto:{pid}")],
+            [InlineKeyboardButton("🔀 Stock Mode: Number ⇄ Unlimited", callback_data=f"admin:prodmode:{pid}")],
             [toggle, InlineKeyboardButton("🗑️ Delete", callback_data=f"admin:proddel:{pid}")],
-            [InlineKeyboardButton("🛍️ Products List", callback_data="admin:products"),
-             InlineKeyboardButton("🔐 Admin Panel", callback_data="admin:panel")],
+            [InlineKeyboardButton("🔐 Admin Panel", callback_data="admin:panel")],
+            admin_nav_row("admin:products"),
         ]
     )
     try:
@@ -1333,11 +1428,11 @@ async def _finalize_product_wizard(update: Update, context: ContextTypes.DEFAULT
     maxord = db_one("SELECT COALESCE(MAX(sort_order),0) AS m FROM products")
     db_insert(
         "INSERT INTO products(name, price_stars, mrp_text, description, validity_days, warranty_days, "
-        "stock, photo_file_id, is_active, sort_order, created_at) VALUES(?,?,?,?,?,?,?,?,1,?,?)",
+        "stock, photo_file_id, is_active, sort_order, created_at, stock_mode) VALUES(?,?,?,?,?,?,?,?,1,?,?,?)",
         (
             draft["name"], draft["price"], draft.get("mrp", ""), draft.get("desc", ""),
             draft["validity"], draft["warranty"], draft["stock"], photo_file_id or "",
-            int(maxord["m"]) + 1, to_iso(now_utc()),
+            int(maxord["m"]) + 1, to_iso(now_utc()), draft.get("stock_mode", "count"),
         ),
     )
     text = (
@@ -1363,6 +1458,53 @@ async def _finalize_product_wizard(update: Update, context: ContextTypes.DEFAULT
         await context.bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
 
 
+async def _show_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    ids = sorted(get_approved_ids())
+    lines = [
+        "👥 <b>Approved Users</b>\n",
+        "Ye users group-join check ke <b>bina</b> bhi store use kar sakte hain — jinka Verify atak raha ho, unke liye ye ilaaj hai.\n",
+    ]
+    rows = []
+    if not ids:
+        lines.append("Abhi koi approved user nahi hai.")
+    for uid_ in ids:
+        u = db_one("SELECT * FROM users WHERE user_id=?", (uid_,)) or {}
+        lines.append(f"• <code>{uid_}</code> — {u.get('first_name', '?')}")
+        rows.append([InlineKeyboardButton(f"❌ {uid_} ko Hatayo", callback_data=f"admin:unapprove:{uid_}")])
+    rows.append([InlineKeyboardButton("➕ User Approve Karo (Telegram ID se)", callback_data="admin:approve")])
+    rows.append(admin_nav_row("admin:panel"))
+    text = "\n".join(lines)
+    try:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    except BadRequest:
+        await context.bot.send_message(q.message.chat_id, text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def _show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    wel = get_setting("welcome_text")
+    text = (
+        "⚙️ <b>Store Settings</b>\n\n"
+        f"🏪 Store ka Naam: <b>{get_store_name()}</b>\n"
+        f"🔗 Group Link: {get_group_link() or '(set nahi hai)'}\n"
+        f"📝 Welcome Text: {'custom set hai ✅' if wel else 'default chal raha hai'}\n\n"
+        "Jo badalna hai, dabao — <b>turant LIVE</b> ho jayega, redeploy ki zaroorat nahi:"
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✏️ Store ka Naam", callback_data="admin:setfield:store_name"),
+             InlineKeyboardButton("📝 Welcome Text", callback_data="admin:setfield:welcome_text")],
+            [InlineKeyboardButton("🔗 Group Link Badlo", callback_data="admin:setfield:group_link")],
+            admin_nav_row("admin:panel"),
+        ]
+    )
+    try:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    except BadRequest:
+        await context.bot.send_message(q.message.chat_id, text, parse_mode="HTML", reply_markup=kb)
+
+
 async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not is_admin(q.from_user.id):
@@ -1385,7 +1527,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"• <b>{order_code(o['id'])}</b> — ⭐{o['stars']} • {age_h:.1f} ghante ho gaye")
                 rows.append([InlineKeyboardButton(f"✅ Deliver {order_code(o['id'])}", callback_data=f"admin:deliver:{o['id']}")])
             text = "\n".join(lines)
-        rows.append([InlineKeyboardButton("🔐 Admin Panel", callback_data="admin:panel")])
+        rows.append(admin_nav_row("admin:panel"))
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
 
     elif data.startswith("admin:deliver:"):
@@ -1399,8 +1541,8 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             q.from_user.id,
             f"📦 <b>Delivery — Order {order_code(oid)}</b>\n\n"
             "Ab customer ko bhejne wala <b>access / details likh ke (ya photo/file) bhejo</b> — "
-            "bot wahi cheez customer ko delivery bana ke bhej dega.\nCancel karna ho to /cancel bhejo.",
-            parse_mode="HTML",
+            "bot wahi cheez customer ko delivery bana ke bhej dega.",
+            parse_mode="HTML", reply_markup=cancel_kb(),
         )
 
     elif data == "admin:stats":
@@ -1421,7 +1563,90 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⭐ Total Stars Earned: <b>{stars_sum}</b>{bal_line}\n"
             f"📦 Kul Stock Bacha: <b>{total_stock()}</b>",
             parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔐 Admin Panel", callback_data="admin:panel")]]),
+            reply_markup=InlineKeyboardMarkup([admin_nav_row("admin:panel")]),
+        )
+
+    elif data == "admin:health":
+        lines = ["🩺 <b>Bot Health Check</b>\n"]
+        try:
+            me = await context.bot.get_me()
+            lines.append(f"🤖 Bot: @{me.username} ✅")
+        except Exception as e:
+            lines.append(f"🤖 Bot jaanch: ❌ {e}")
+        lines.append(f"👥 GROUP_ID (bot ko jo dikh raha hai): <code>{GROUP_ID}</code>")
+        if not GROUP_ID:
+            lines.append("⚠️ <b>GROUP_ID set hi nahi hai</b> — users ka Verify kaam nahi karega! Render → Environment me dalo.")
+        else:
+            try:
+                chat = await context.bot.get_chat(GROUP_ID)
+                lines.append(f"🏠 Group: <b>{getattr(chat, 'title', '')}</b> ✅ mil gaya")
+                me = await context.bot.get_me()
+                mem = await context.bot.get_chat_member(GROUP_ID, me.id)
+                ok_role = mem.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+                lines.append(f"🛡️ Bot ka group me role: <b>{mem.status}</b> " + ("✅" if ok_role else "⚠️ — bot ko group me ADMIN banao, warna membership check fail hoga!"))
+            except Exception as e:
+                lines.append(f"🏠 Group jaanch: ❌ <code>{e}</code>")
+                lines.append("👉 Matlab GROUP_ID galat hai. Sahi value Render → Environment me bilkul aisi honi chahiye: <code>-1003961533075</code> (minus ke saath, bina space/quotes).")
+        try:
+            db_one("SELECT 1 AS x")
+            lines.append("🗄️ Database: ✅ chal raha hai")
+        except Exception as e:
+            lines.append(f"🗄️ Database: ❌ {e}")
+        lines.append(f"🛍️ Products: {len(get_products())} (Live: {len(get_products(active_only=True))})")
+        lines.append(f"🔓 Approved users: {len(get_approved_ids())}")
+        if _last_member_error:
+            lines.append(f"⚠️ Aakhiri membership-check error: <code>{_last_member_error}</code>")
+        else:
+            lines.append("✅ Membership check me aakhiri baar koi error nahi aaya")
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🔄 Dobara Check Karo", callback_data="admin:health")],
+                admin_nav_row("admin:panel"),
+            ]
+        )
+        try:
+            await q.edit_message_text("\n".join(lines), parse_mode="HTML", reply_markup=kb)
+        except BadRequest:
+            await context.bot.send_message(q.message.chat_id, "\n".join(lines), parse_mode="HTML", reply_markup=kb)
+
+    elif data == "admin:users":
+        await _show_users(update, context)
+
+    elif data == "admin:approve":
+        context.user_data["awaiting"] = {"kind": "approve_id"}
+        await context.bot.send_message(
+            q.from_user.id,
+            "➕ <b>User Approve</b>\n\nJis user ka Verify atak raha hai, uski <b>Telegram ID (number)</b> bhejo — woh bina group-check ke store use kar payega.\n(ID user se @userinfobot pe bhijwa sakte ho, ya woh apni ID bot me dekh sakta hai.)",
+            parse_mode="HTML", reply_markup=cancel_kb(),
+        )
+
+    elif data.startswith("admin:unapprove:"):
+        uid_ = int(data.split(":")[2])
+        ids = get_approved_ids()
+        ids.discard(uid_)
+        set_approved_ids(ids)
+        await q.answer(f"❌ {uid_} approved list se hat gaya.")
+        await _show_users(update, context)
+
+    elif data == "admin:settings":
+        await _show_settings(update, context)
+
+    elif data.startswith("admin:setfield:"):
+        field = data.split(":")[2]
+        prompts = {
+            "store_name": "✏️ Store ka <b>naya naam</b> bhejo (jaise: Apna AI Store):",
+            "welcome_text": "📝 Home screen ka <b>naya welcome text</b> bhejo (jo 'Hello {name}' ke neeche dikhega).\nDefault pe wapas karna ho to sirf <b>-</b> bhejo:",
+            "group_link": "🔗 <b>Naya Public Group link</b> bhejo (https://t.me/... se shuru hona chahiye).\nPurane (env wale) link pe wapas karna ho to sirf <b>-</b> bhejo:",
+        }
+        context.user_data["awaiting"] = {"kind": "set_field", "field": field}
+        await context.bot.send_message(q.from_user.id, prompts[field], parse_mode="HTML", reply_markup=cancel_kb())
+
+    elif data == "admin:osearch":
+        context.user_data["awaiting"] = {"kind": "order_search"}
+        await context.bot.send_message(
+            q.from_user.id,
+            "🔍 <b>Order Search</b>\n\nOrder ID bhejo — jaise <b>EL1005</b> (ya sirf number):",
+            parse_mode="HTML", reply_markup=cancel_kb(),
         )
 
     elif data in ("admin:products", "admin:stock", "admin:setphoto"):
@@ -1433,8 +1658,8 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             q.from_user.id,
             "🆕 <b>Naya Product — Step 1/8: Naam</b>\n\n"
-            "Product ka <b>naam</b> bhejo:\n(jaise: <i>ChatGPT Plus — 1 Month</i>)\n\nCancel karna ho to /cancel bhejo.",
-            parse_mode="HTML",
+            "Product ka <b>naam</b> bhejo:\n(jaise: <i>ChatGPT Plus — 1 Month</i>)",
+            parse_mode="HTML", reply_markup=cancel_kb(),
         )
 
     elif data.startswith("admin:prod:"):
@@ -1463,7 +1688,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "warranty_days": f"🛡️ <b>{prod['name']}</b> ki <b>Warranty kitne din</b>? Sirf number bhejo:",
         }
         context.user_data["awaiting"] = {"kind": "pe_field", "pid": pid, "field": field}
-        await context.bot.send_message(q.from_user.id, prompts[field], parse_mode="HTML")
+        await context.bot.send_message(q.from_user.id, prompts[field], parse_mode="HTML", reply_markup=cancel_kb())
 
     elif data.startswith("admin:prodstock:"):
         parts = data.split(":")
@@ -1476,8 +1701,9 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             q.from_user.id,
             f"📦 <b>{prod['name']}</b> — abhi stock: <b>{prod['stock']}</b>\n"
-            + ("🔢 Kitna stock <b>SET</b> karna hai? Sirf number bhejo:" if mode == "set" else "🔢 Kitna stock <b>ADD</b> karna hai? Sirf number bhejo:"),
-            parse_mode="HTML",
+            + ("🔢 Kitna stock <b>SET</b> karna hai? Number bhejo:" if mode == "set" else "🔢 Kitna stock <b>ADD</b> karna hai? Number bhejo:")
+            + "\n♾️ Ya <b>unlimited</b> likho — bina-number wala mode (humesha Available) ho jayega.",
+            parse_mode="HTML", reply_markup=cancel_kb(),
         )
 
     elif data.startswith("admin:prodphoto:"):
@@ -1490,7 +1716,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             q.from_user.id,
             f"🖼️ <b>{prod['name']}</b> ki photo bhejo —\njo photo bhejoge wahi <b>sirf isi product</b> pe lagegi, dusre product ki photo se koi lena-dena nahi.",
-            parse_mode="HTML",
+            parse_mode="HTML", reply_markup=cancel_kb(),
         )
 
     elif data.startswith("admin:proddelok:"):
@@ -1525,6 +1751,23 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ),
             )
 
+    elif data.startswith("admin:prodmode:"):
+        pid = int(data.split(":")[2])
+        prod = get_product(pid)
+        if not prod:
+            await q.answer("Product nahi mila.", show_alert=True)
+            return
+        new_mode = "count" if (prod.get("stock_mode") or "count") == "unlimited" else "unlimited"
+        db_exec("UPDATE products SET stock_mode=? WHERE id=?", (new_mode, pid))
+        await q.answer("♾️ Unlimited mode ON — ab ye product humesha Available rahega!" if new_mode == "unlimited" else "🔢 Number mode ON — ab stock gina jayega.")
+        await _show_product_detail(update, context, pid)
+
+    elif data == "input:cancel":
+        context.user_data.pop("awaiting", None)
+        context.user_data.pop("prod_draft", None)
+        await q.answer("❌ Cancel ho gaya.")
+        await send_admin_panel(update, context)
+
     elif data == "prodwiz:skip":
         if context.user_data.get("awaiting", {}).get("kind") == "pw_photo":
             await _finalize_product_wizard(update, context, None)
@@ -1534,7 +1777,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             q.from_user.id,
             "📣 <b>Broadcast</b> — jo message (text/photo) bhejoge, woh <b>sab users</b> ko jayega. Dhyaan se bhejna!",
-            parse_mode="HTML",
+            parse_mode="HTML", reply_markup=cancel_kb(),
         )
 
     elif data == "admin:reports":
@@ -1547,7 +1790,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"• <b>{report_code(r['id'])}</b> — {order_code(r['order_id'])} — {REPORT_CATEGORIES.get(r['category'], '')}")
                 rows.append([InlineKeyboardButton(f"👁️ {report_code(r['id'])}", callback_data=f"admin:report:{r['id']}")])
             text = "\n".join(lines)
-        rows.append([InlineKeyboardButton("🔐 Admin Panel", callback_data="admin:panel")])
+        rows.append(admin_nav_row("admin:panel"))
         await q.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
 
     elif data.startswith("admin:report:"):
@@ -1560,6 +1803,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("💬 Reply Karo", callback_data=f"admin:rreply:{rid}")],
                 [InlineKeyboardButton("🔄 Replacement Do", callback_data=f"admin:rreplace:{rid}")],
                 [InlineKeyboardButton("✅ Report Close", callback_data=f"admin:rclose:{rid}")],
+                admin_nav_row("admin:reports"),
             ]
         )
         await context.bot.send_message(
@@ -1572,7 +1816,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("admin:rreply:"):
         rid = int(data.split(":")[2])
         context.user_data["awaiting"] = {"kind": "report_reply", "report_id": rid}
-        await context.bot.send_message(q.from_user.id, f"💬 <b>{report_code(rid)}</b> — customer ko bhejne wala jawab likho:", parse_mode="HTML")
+        await context.bot.send_message(q.from_user.id, f"💬 <b>{report_code(rid)}</b> — customer ko bhejne wala jawab likho:", parse_mode="HTML", reply_markup=cancel_kb())
 
     elif data.startswith("admin:rreplace:"):
         rid = int(data.split(":")[2])
@@ -1580,7 +1824,7 @@ async def cb_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             q.from_user.id,
             f"🔄 <b>{report_code(rid)}</b> — replacement access/details bhejo, bot customer ko bhej dega aur report band kar dega:",
-            parse_mode="HTML",
+            parse_mode="HTML", reply_markup=cancel_kb(),
         )
 
     elif data.startswith("admin:rclose:"):
@@ -1653,7 +1897,7 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data.setdefault("prod_draft", {})["name"] = msg.text.strip()[:60]
         context.user_data["awaiting"] = {"kind": "pw_price"}
-        await msg.reply_text("🆕 <b>Step 2/8 — Daam</b>\n\nKitne <b>Stars</b> me bechna hai? Sirf number bhejo (jaise: 150)", parse_mode="HTML")
+        await msg.reply_text("🆕 <b>Step 2/8 — Daam</b>\n\nKitne <b>Stars</b> me bechna hai? Sirf number bhejo (jaise: 150)", parse_mode="HTML", reply_markup=cancel_kb())
         return
 
     if kind == "pw_price":
@@ -1663,14 +1907,14 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data.setdefault("prod_draft", {})["price"] = n
         context.user_data["awaiting"] = {"kind": "pw_mrp"}
-        await msg.reply_text("🆕 <b>Step 3/8 — Asli Daam (cut wala)</b>\n\nMRP jaisa dikhana hai to bhejo (jaise: ₹599).\nNahi dikhana to sirf <b>-</b> bhejo.", parse_mode="HTML")
+        await msg.reply_text("🆕 <b>Step 3/8 — Asli Daam (cut wala)</b>\n\nMRP jaisa dikhana hai to bhejo (jaise: ₹599).\nNahi dikhana to sirf <b>-</b> bhejo.", parse_mode="HTML", reply_markup=cancel_kb())
         return
 
     if kind == "pw_mrp":
         t = (msg.text or "").strip()
         context.user_data.setdefault("prod_draft", {})["mrp"] = "" if t == "-" else t[:30]
         context.user_data["awaiting"] = {"kind": "pw_validity"}
-        await msg.reply_text("🆕 <b>Step 4/8 — Validity</b>\n\nValidity kitne <b>din</b> ki hai? Sirf number bhejo (jaise: 30)", parse_mode="HTML")
+        await msg.reply_text("🆕 <b>Step 4/8 — Validity</b>\n\nValidity kitne <b>din</b> ki hai? Sirf number bhejo (jaise: 30)", parse_mode="HTML", reply_markup=cancel_kb())
         return
 
     if kind == "pw_validity":
@@ -1680,7 +1924,7 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data.setdefault("prod_draft", {})["validity"] = n
         context.user_data["awaiting"] = {"kind": "pw_warranty"}
-        await msg.reply_text("🆕 <b>Step 5/8 — Warranty</b>\n\nWarranty kitne <b>din</b> ki hai? Sirf number bhejo (jaise: 25)", parse_mode="HTML")
+        await msg.reply_text("🆕 <b>Step 5/8 — Warranty</b>\n\nWarranty kitne <b>din</b> ki hai? Sirf number bhejo (jaise: 25)", parse_mode="HTML", reply_markup=cancel_kb())
         return
 
     if kind == "pw_warranty":
@@ -1690,24 +1934,34 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         context.user_data.setdefault("prod_draft", {})["warranty"] = n
         context.user_data["awaiting"] = {"kind": "pw_stock"}
-        await msg.reply_text("🆕 <b>Step 6/8 — Stock</b>\n\nShuru me <b>stock</b> kitna rakhun? Sirf number bhejo (jaise: 10)", parse_mode="HTML")
+        await msg.reply_text("🆕 <b>Step 6/8 — Stock</b>\n\nDo tareeke hain:\n🔢 <b>Number</b> bhejo (jaise: 10) — utna hi bikega, khatm hone pe Out of Stock\n♾️ <b>unlimited</b> likho — bina ginti ke humesha Available rahega (number wala jhanjhat hi nahi)\n\nJo chaahe bhejo:", parse_mode="HTML", reply_markup=cancel_kb())
         return
 
     if kind == "pw_stock":
-        n = _to_int(msg.text) if msg.text else None
-        if n is None or n < 0 or n > 1000000:
-            await msg.reply_text("🔢 Sirf number bhejo (0 ya zyada).")
-            return
-        context.user_data.setdefault("prod_draft", {})["stock"] = n
+        t = (msg.text or "").strip().lower()
+        if t in ("unlimited", "humesha", "infinite", "♾️"):
+            context.user_data.setdefault("prod_draft", {})["stock"] = 0
+            context.user_data["prod_draft"]["stock_mode"] = "unlimited"
+            n = 0
+        else:
+            n = _to_int(msg.text) if msg.text else None
+            if n is None or n < 0 or n > 1000000:
+                await msg.reply_text("🔢 Number bhejo (0 ya zyada) — ya <b>unlimited</b> likho.", parse_mode="HTML")
+                return
+            context.user_data.setdefault("prod_draft", {})["stock"] = n
+            context.user_data["prod_draft"]["stock_mode"] = "count"
         context.user_data["awaiting"] = {"kind": "pw_desc"}
-        await msg.reply_text("🆕 <b>Step 7/8 — Details</b>\n\nProduct ki <b>details/description</b> likho — features wagera jo customer ko dikhana hai (kai line bhi chalega).\nKuch nahi likhna to sirf <b>-</b> bhejo.", parse_mode="HTML")
+        await msg.reply_text("🆕 <b>Step 7/8 — Details</b>\n\nProduct ki <b>details/description</b> likho — features wagera jo customer ko dikhana hai (kai line bhi chalega).\nKuch nahi likhna to sirf <b>-</b> bhejo.", parse_mode="HTML", reply_markup=cancel_kb())
         return
 
     if kind == "pw_desc":
         t = (msg.text or "").strip()
         context.user_data.setdefault("prod_draft", {})["desc"] = "" if t == "-" else t[:1500]
         context.user_data["awaiting"] = {"kind": "pw_photo"}
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("⏭️ Photo Nahi Hai — Skip Karo", callback_data="prodwiz:skip")]])
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏭️ Photo Nahi Hai — Skip Karo", callback_data="prodwiz:skip")],
+            [InlineKeyboardButton("❌ Cancel Karo", callback_data="input:cancel")],
+        ])
         draft_name = context.user_data.get("prod_draft", {}).get("name", "is product")
         await msg.reply_text(
             f"🆕 <b>Step 8/8 — Photo</b>\n\n<b>{draft_name}</b> ki <b>photo bhejo</b> 📸 — jo photo bhejoge wahi isi product pe lagegi.\nPhoto nahi hai to Skip dabao:",
@@ -1720,6 +1974,79 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _finalize_product_wizard(update, context, msg.photo[-1].file_id)
         else:
             await msg.reply_text("📸 Photo bhejo, ya upar wala Skip button dabao.")
+        return
+
+    if kind == "approve_id":
+        n = _to_int(msg.text) if msg.text else None
+        if n is None or n <= 0:
+            await msg.reply_text("🔢 Sahi Telegram ID (number) bhejo.")
+            return
+        ids = get_approved_ids()
+        ids.add(n)
+        set_approved_ids(ids)
+        context.user_data.pop("awaiting", None)
+        await msg.reply_text(f"✅ User <code>{n}</code> approve ho gaya — ab woh bina group-check ke store use kar sakta hai. Usko bolo /start dobara kare.", parse_mode="HTML")
+        return
+
+    if kind == "set_field":
+        field = state.get("field")
+        t = (msg.text or "").strip()
+        if field == "store_name":
+            if not t:
+                await msg.reply_text("✍️ Naam khali nahi ho sakta.")
+                return
+            set_setting("store_name", t[:40])
+            context.user_data.pop("awaiting", None)
+            await msg.reply_text(f"✅ Store ka naam ab: <b>{t[:40]}</b> — turant LIVE hai.", parse_mode="HTML")
+        elif field == "welcome_text":
+            set_setting("welcome_text", "" if t == "-" else t[:600])
+            context.user_data.pop("awaiting", None)
+            await msg.reply_text("✅ Welcome text " + ("default pe wapas ho gaya." if t == "-" else "badal gaya — Home pe turant dikhega."), parse_mode="HTML")
+        elif field == "group_link":
+            if t == "-":
+                set_setting("group_link", "")
+                context.user_data.pop("awaiting", None)
+                await msg.reply_text("✅ Group link purane (env) wale pe wapas ho gaya.")
+            elif t.startswith("http"):
+                set_setting("group_link", t[:200])
+                context.user_data.pop("awaiting", None)
+                await msg.reply_text("✅ Group link badal gaya — Join/Home buttons pe turant LIVE hai.")
+            else:
+                await msg.reply_text("🔗 Sahi link bhejo (https:// se shuru) — ya - bhejo.")
+                return
+        else:
+            context.user_data.pop("awaiting", None)
+        return
+
+    if kind == "order_search":
+        raw = (msg.text or "").strip().upper().replace(" ", "")
+        num = None
+        if raw.startswith("EL") and raw[2:].isdigit():
+            num = int(raw[2:]) - 1000
+        elif raw.isdigit():
+            v = int(raw)
+            num = v - 1000 if v >= 1000 else v
+        o = db_one("SELECT * FROM orders WHERE id=?", (num,)) if num else None
+        context.user_data.pop("awaiting", None)
+        if not o:
+            await msg.reply_text("❌ Aisa koi order nahi mila. Order ID check karke dobara try karo (Admin Panel → 🔍 Order Search).")
+            return
+        u = db_one("SELECT * FROM users WHERE user_id=?", (o["user_id"],)) or {}
+        rows = []
+        if o["status"] == "pending":
+            rows.append([InlineKeyboardButton(f"✅ Deliver {order_code(o['id'])}", callback_data=f"admin:deliver:{o['id']}")])
+        rows.append([InlineKeyboardButton("🔐 Admin Panel", callback_data="admin:panel")])
+        rows.append([InlineKeyboardButton("🏠 Home", callback_data="nav:home")])
+        await msg.reply_text(
+            f"🧾 <b>Order {order_code(o['id'])}</b>\n\n"
+            f"Product: {o['product']}\n"
+            f"User: {u.get('first_name', '?')} (@{u.get('username', '-')}) • <code>{o['user_id']}</code>\n"
+            f"Paid: ⭐{o['stars']} Stars\n"
+            f"Status: <b>{o['status'].title()}</b>\n"
+            f"Order Time: {fmt_dt(o['created_at'])}"
+            + (f"\nDelivered: {fmt_dt(o['delivered_at'])}" if o.get("delivered_at") else ""),
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows),
+        )
         return
 
     # ---- Product Edit (per-product) ----
@@ -1757,13 +2084,19 @@ async def handle_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "pe_stock":
         pid = state.get("pid")
         prod = get_product(pid)
-        n = _to_int(msg.text) if msg.text else None
         if not prod:
             context.user_data.pop("awaiting", None)
             return
-        if n is None or n < 0 or n > 1000000:
-            await msg.reply_text("🔢 Sirf number bhejo (0 ya zyada).")
+        if (msg.text or "").strip().lower() in ("unlimited", "humesha", "infinite", "♾️"):
+            db_exec("UPDATE products SET stock_mode='unlimited' WHERE id=?", (pid,))
+            context.user_data.pop("awaiting", None)
+            await msg.reply_text(f"♾️ <b>{prod['name']}</b> ab <b>Unlimited mode</b> me hai — humesha Available rahega, number ki zaroorat nahi.", parse_mode="HTML")
             return
+        n = _to_int(msg.text) if msg.text else None
+        if n is None or n < 0 or n > 1000000:
+            await msg.reply_text("🔢 Number bhejo (0 ya zyada) — ya <b>unlimited</b> likho.", parse_mode="HTML")
+            return
+        db_exec("UPDATE products SET stock_mode='count' WHERE id=?", (pid,))
         new_stock = int(prod["stock"]) + n if state.get("mode") == "add" else n
         set_product_stock(pid, new_stock)
         context.user_data.pop("awaiting", None)
@@ -1870,7 +2203,7 @@ async def group_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for m in msg.new_chat_members:
             if not m.is_bot:
                 await msg.reply_text(
-                    f"👋 Welcome {m.first_name}! <b>{STORE_NAME} Public Group</b> me swagat hai.\n"
+                    f"👋 Welcome {m.first_name}! <b>{get_store_name()} Public Group</b> me swagat hai.\n"
                     "📌 Rules: Spam/link mat bhejo, sabse tameez se baat karo, order ki dikkat bot me Report se bhejo.",
                     parse_mode="HTML",
                 )
@@ -2013,6 +2346,38 @@ def _start_health_server():
 
 async def _post_init(app: Application):
     init_db()
+    # ---- Self-check: users ke Verify ke liye group config sabse zaroori hai.
+    # Gadbad ho to bot chup nahi rahega — admin ko turant khabar jayegi.
+    problems = []
+    if not GROUP_ID:
+        problems.append("GROUP_ID set hi nahi hai — force-join gate band hai, koi bhi user Verify nahi kar payega.")
+    else:
+        try:
+            chat = await app.bot.get_chat(GROUP_ID)
+            me = await app.bot.get_me()
+            mem = await app.bot.get_chat_member(GROUP_ID, me.id)
+            if mem.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+                problems.append(
+                    f"Bot group '{getattr(chat, 'title', '')}' me admin nahi hai (status: {mem.status}) — "
+                    "membership check fail hoga. Bot ko group me admin banao."
+                )
+        except Exception as e:
+            problems.append(
+                f"Bot GROUP_ID <code>{GROUP_ID}</code> wale group tak pahunch nahi pa raha ({e}). "
+                "Render → Environment me GROUP_ID bilkul sahi hona chahiye: <code>-1003961533075</code> (aage minus ke saath, bina space/quotes ke)."
+            )
+    if problems:
+        log.warning("SELF-CHECK problems: %s", problems)
+        alert = (
+            "⚠️ <b>Bot Self-Check — kuch gadbad mili hai!</b>\n\n"
+            + "\n".join("• " + x for x in problems)
+            + "\n\nUsers ka Verify isiliye atak sakta hai. Poori jaanch: Admin Panel → 🩺 Health Check"
+        )
+        for aid in ADMIN_IDS:
+            try:
+                await app.bot.send_message(aid, alert, parse_mode="HTML")
+            except Exception:
+                pass
 
 
 def main():
@@ -2043,7 +2408,7 @@ def main():
     app.add_handler(CallbackQueryHandler(cb_buy, pattern="^buy:"))
     app.add_handler(CallbackQueryHandler(cb_order_view, pattern="^order:view:"))
     app.add_handler(CallbackQueryHandler(cb_report, pattern="^report:"))
-    app.add_handler(CallbackQueryHandler(cb_admin, pattern="^(admin:|prodwiz:)"))
+    app.add_handler(CallbackQueryHandler(cb_admin, pattern="^(admin:|prodwiz:|input:)"))
     app.add_handler(CallbackQueryHandler(cb_nav, pattern="^(nav:|noop$)"))
 
     app.add_handler(PreCheckoutQueryHandler(pre_checkout))
